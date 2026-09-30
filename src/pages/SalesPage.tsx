@@ -4,18 +4,21 @@ import type { Product, Sale, SaleItem } from "../types/Product";
 import {
     createSale,
     deleteSaleDraft,
-    formatStockByPackagingHierarchy,
     getAvailableQuantityInUnit,
+    getCurrentStockForAllProducts,
     getProducts,
     getSales,
     getSaleStockAllocationPreview,
-    getVariantAvailabilityByPackagingUnit,
     initializeDatabase,
     INVENTORY_CHANGED_EVENT,
     PENDING_TASKS_CHANGED_EVENT,
     saveSaleDraft,
+    type CurrentStockEntry,
     type SaleStockAllocation,
 } from "../database/database";
+import { calculateStockBreakdown } from "../domain/stockBreakdown";
+import { calculateSaleAmounts, calculateSaleLineAmount } from "../domain/saleCalculations";
+import { isValidExpiryDate } from "../domain/expirySemantics";
 import { formatExpiryStatus } from "../utils/expiry";
 
 type SaleDraftItem = SaleItem & {
@@ -33,11 +36,34 @@ const formatVariantInfo = (variant: Product["variants"][number] | undefined) =>
         .filter((value) => value?.trim())
         .join(" ");
 
+const orderVariantsByExpiry = (
+    product: Product,
+    stockByProduct: Record<string, CurrentStockEntry[]>
+) => product.variants
+    .map((variant, index) => {
+        const expiryDate = (stockByProduct[product.id] ?? [])
+            .filter((stock) => stock.variantId === variant.id && stock.quantity > 0)
+            .map((stock) => stock.expiryDate?.trim() ?? "")
+            .filter(isValidExpiryDate)
+            .sort()[0];
+        return { variant, index, expiryDate };
+    })
+    .sort((left, right) => {
+        if (left.expiryDate && right.expiryDate) {
+            return left.expiryDate.localeCompare(right.expiryDate) || left.index - right.index;
+        }
+        if (left.expiryDate) return -1;
+        if (right.expiryDate) return 1;
+        return left.index - right.index;
+    })
+    .map(({ variant }) => variant);
+
 const SalesPage = () => {
     const location = useLocation();
     const routeState = location.state as { draftType?: string; draftId?: string } | null;
     const requestedDraftId = routeState?.draftType === "sale" ? routeState.draftId : undefined;
     const [products, setProducts] = useState<Product[]>([]);
+    const [stockByProduct, setStockByProduct] = useState<Record<string, CurrentStockEntry[]>>({});
     const [sales, setSales] = useState<Sale[]>([]);
     const [productSearch, setProductSearch] = useState("");
     const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
@@ -50,13 +76,13 @@ const SalesPage = () => {
     const [notes, setNotes] = useState("");
     const [discount, setDiscount] = useState(0);
     const [cart, setCart] = useState<SaleDraftItem[]>([]);
+    const [editingSaleItemId, setEditingSaleItemId] = useState<string | null>(null);
     const [historyExpanded, setHistoryExpanded] = useState(false);
     const [historySearch, setHistorySearch] = useState("");
     const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
     const [message, setMessage] = useState("");
     const [error, setError] = useState("");
     const [isSaving, setIsSaving] = useState(false);
-    const [availabilityByUnit, setAvailabilityByUnit] = useState<Array<{ unitId: string; unitName: string; quantity: number }>>([]);
     const [allocationPreview, setAllocationPreview] = useState<SaleStockAllocation[] | null>(null);
     const [allocationError, setAllocationError] = useState("");
     const [isDraftSaving, setIsDraftSaving] = useState(false);
@@ -83,13 +109,14 @@ const SalesPage = () => {
 
         const id = requestedId ?? draftSaleIdRef.current ?? crypto.randomUUID();
         draftSaleIdRef.current = id;
+        const amounts = calculateSaleAmounts(items, header.discount);
         const sale: Sale = {
             id,
             date: header.date,
             soldBy: header.soldBy.trim() || undefined,
             notes: header.notes.trim() || undefined,
             discount: header.discount,
-            totalAmount: Math.max(0, items.reduce((total, item) => total + item.quantity * item.unitPrice, 0) - Math.max(0, header.discount)),
+            totalAmount: amounts.grandTotal,
             status: "draft",
             items: items.map(({ productName, variantLabel, packagingUnitName, ...item }) => ({
                 ...item,
@@ -112,8 +139,13 @@ const SalesPage = () => {
         const loadData = async () => {
             try {
                 await initializeDatabase();
-                const [productsFromDb, salesFromDb] = await Promise.all([getProducts(), getSales()]);
+                const [productsFromDb, salesFromDb, stockFromDb] = await Promise.all([
+                    getProducts(),
+                    getSales(),
+                    getCurrentStockForAllProducts(),
+                ]);
                 setProducts(productsFromDb);
+                setStockByProduct(stockFromDb);
                 setSales(salesFromDb.filter((sale) => sale.status !== "draft"));
 
                 const draft = requestedDraftId
@@ -149,6 +181,13 @@ const SalesPage = () => {
         };
 
         void loadData();
+        const refreshStock = () => {
+            void getCurrentStockForAllProducts().then(setStockByProduct).catch((loadError) => {
+                console.error("Failed to refresh stock for Sales variant ordering:", loadError);
+            });
+        };
+        window.addEventListener(INVENTORY_CHANGED_EVENT, refreshStock);
+        return () => window.removeEventListener(INVENTORY_CHANGED_EVENT, refreshStock);
     }, []);
 
     const filteredProducts = useMemo(() => {
@@ -163,33 +202,31 @@ const SalesPage = () => {
         ].some((value) => value.toLowerCase().includes(search)));
     }, [productSearch, products]);
 
-    const activeVariant = selectedProduct?.variants.find((variant) => variant.id === selectedVariantId)
-        ?? selectedProduct?.variants[0];
+    const orderedVariants = selectedProduct ? orderVariantsByExpiry(selectedProduct, stockByProduct) : [];
+    const activeVariant = orderedVariants.find((variant) => variant.id === selectedVariantId)
+        ?? orderedVariants[0];
     const packagingUnits = activeVariant?.packagingUnits ?? [];
     const selectedPackagingUnit = packagingUnits.find((unit) => unit.id === selectedPackagingUnitId)
         ?? packagingUnits[0];
+    const stockBreakdown = selectedProduct && activeVariant
+        ? calculateStockBreakdown(
+            (stockByProduct[selectedProduct.id] ?? [])
+                .filter((stock) => stock.variantId === activeVariant.id)
+                .map((stock) => ({
+                    packagingUnitId: stock.packagingUnitId,
+                    quantity: stock.quantity,
+                })),
+            activeVariant.packagingUnits
+        )
+        : [];
+    const stockBreakdownText = stockBreakdown.length > 0
+        ? stockBreakdown.map(({ quantity: count, packagingUnitName }) =>
+            `${count} ${packagingUnitName || "unit"}${count === 1 ? "" : "s"}`
+        ).join(" + ")
+        : "0";
     const hasMeaningfulVariantInfo = selectedProduct?.variants.some((variant) =>
         [variant.strength, variant.strengthUnit, variant.form].some((value) => value?.trim())
     ) ?? false;
-
-    useEffect(() => {
-        if (!selectedProduct || !activeVariant) {
-            setAvailabilityByUnit([]);
-            return;
-        }
-
-        const loadAvailability = async () => {
-            try {
-                const available = await getVariantAvailabilityByPackagingUnit(selectedProduct.id, activeVariant.id);
-                setAvailabilityByUnit(available);
-            } catch (loadError) {
-                console.error(loadError);
-                setAvailabilityByUnit([]);
-            }
-        };
-
-        void loadAvailability();
-    }, [selectedProduct, activeVariant]);
 
     useEffect(() => {
         if (!selectedProduct || !activeVariant || !selectedPackagingUnit) {
@@ -225,11 +262,10 @@ const SalesPage = () => {
         };
     }, [selectedProduct?.id, activeVariant?.id, selectedPackagingUnit?.id, quantity]);
 
-    const subtotal = cart.reduce((total, item) => total + item.quantity * item.unitPrice, 0);
-    const grandTotal = Math.max(0, subtotal - Math.max(0, discount));
+    const { subtotal, grandTotal } = calculateSaleAmounts(cart, discount);
 
     const selectProduct = (product: Product) => {
-        const variant = product.variants[0];
+        const variant = orderVariantsByExpiry(product, stockByProduct)[0];
         const packagingUnit = variant?.packagingUnits.find((unit) => unit.isDefault)
             ?? variant?.packagingUnits[0];
 
@@ -238,6 +274,7 @@ const SalesPage = () => {
         setSelectedPackagingUnitId(packagingUnit?.id ?? "");
         setUnitPrice(packagingUnit?.sellingPrice ?? 0);
         setQuantity(1);
+        setEditingSaleItemId(null);
         setProductSearch("");
         setError(product.variants.length === 0 || !variant || variant.packagingUnits.length === 0
             ? "This product has no packaging units configured for sale."
@@ -253,6 +290,26 @@ const SalesPage = () => {
         setSelectedVariantId(variantId);
         setSelectedPackagingUnitId(packagingUnit?.id ?? "");
         setUnitPrice(packagingUnit?.sellingPrice ?? 0);
+    };
+
+    const editSaleItem = (item: SaleDraftItem) => {
+        const product = products.find((entry) => entry.id === item.productId);
+        const variant = product?.variants.find((entry) => entry.id === item.variantId);
+        const packagingUnit = variant?.packagingUnits.find((entry) => entry.id === item.packagingUnitId);
+        if (!product || !variant || !packagingUnit) {
+            setError("This sale item can no longer be edited because its product setup is unavailable.");
+            return;
+        }
+
+        setSelectedProduct(product);
+        setSelectedVariantId(variant.id);
+        setSelectedPackagingUnitId(packagingUnit.id);
+        setQuantity(item.quantity);
+        setUnitPrice(item.unitPrice);
+        setEditingSaleItemId(item.id);
+        setProductSearch("");
+        setError("");
+        setMessage("");
     };
 
     const selectPackagingUnit = (unitId: string) => {
@@ -301,8 +358,8 @@ const SalesPage = () => {
         }
 
         const saleId = draftSaleIdRef.current ?? crypto.randomUUID();
-        const nextCart = [...cart, {
-            id: crypto.randomUUID(),
+        const nextItem = {
+            id: editingSaleItemId ?? crypto.randomUUID(),
             saleId,
             productId: selectedProduct.id,
             variantId: activeVariant.id,
@@ -312,14 +369,18 @@ const SalesPage = () => {
             productName: selectedProduct.name,
             variantLabel: formatVariantInfo(activeVariant),
             packagingUnitName: selectedPackagingUnit.name || "Unnamed Unit",
-        }];
+        };
+        const nextCart = editingSaleItemId
+            ? cart.map((item) => item.id === editingSaleItemId ? nextItem : item)
+            : [...cart, nextItem];
 
         setIsDraftSaving(true);
         try {
             await persistDraftSnapshot(nextCart, { date: saleDate, soldBy, notes, discount }, saleId);
             setCart(nextCart);
+            setEditingSaleItemId(null);
             setError("");
-            setMessage("Item added to sale.");
+            setMessage(editingSaleItemId ? "Sale item updated." : "Item added to sale.");
         } catch (saveError) {
             setError(saveError instanceof Error ? saveError.message : "Failed to save the sale draft.");
         } finally {
@@ -336,6 +397,7 @@ const SalesPage = () => {
             }
             draftSaleIdRef.current = null;
             setCart([]);
+            setEditingSaleItemId(null);
             setDiscount(0);
             setSaleDate(today());
             setSoldBy("");
@@ -353,6 +415,7 @@ const SalesPage = () => {
     };
 
     const removeSaleItem = async (itemId: string) => {
+        if (editingSaleItemId === itemId) setEditingSaleItemId(null);
         const nextCart = cart.filter((item) => item.id !== itemId);
         if (nextCart.length === 0) {
             await clearSale();
@@ -489,10 +552,7 @@ const SalesPage = () => {
                         <h3>Available Stock</h3>
                         {activeVariant.packagingUnits.length > 0 ? (
                             <div>
-                                {formatStockByPackagingHierarchy(activeVariant, (availabilityByUnit.length > 0
-                                    ? availabilityByUnit
-                                    : activeVariant.packagingUnits.map((unit) => ({ unitId: unit.id, unitName: unit.name || "Unit", quantity: 0 }))
-                                ).map((entry) => ({ packagingUnitId: entry.unitId, quantity: entry.quantity }))) }
+                                {stockBreakdownText}
                             </div>
                         ) : (
                             <div>No packaging units configured</div>
@@ -509,7 +569,7 @@ const SalesPage = () => {
                             <div>
                                 <label htmlFor="sale-variant">Variant</label>
                                 <select id="sale-variant" value={activeVariant?.id ?? ""} onChange={(event) => selectVariant(event.target.value)}>
-                                    {selectedProduct.variants.map((variant) => (
+                                    {orderedVariants.map((variant) => (
                                         <option key={variant.id} value={variant.id}>{formatVariantInfo(variant) || "Default Variant"}</option>
                                     ))}
                                 </select>
@@ -555,8 +615,9 @@ const SalesPage = () => {
                     <div key={item.id}>
                         <div>
                             <strong>{item.productName}{item.variantLabel ? ` (${item.variantLabel})` : ""}</strong>
-                            <span>{item.packagingUnitName} | {item.quantity} x ₦{item.unitPrice.toFixed(2)} = ₦{(item.quantity * item.unitPrice).toFixed(2)}</span>
+                            <span>{item.packagingUnitName} | {item.quantity} x ₦{item.unitPrice.toFixed(2)} = ₦{calculateSaleLineAmount(item.quantity, item.unitPrice).toFixed(2)}</span>
                         </div>
+                        <button type="button" onClick={() => editSaleItem(item)}>Edit</button>
                         <button type="button" onClick={() => void removeSaleItem(item.id)}>Remove</button>
                     </div>
                 ))}
@@ -570,7 +631,7 @@ const SalesPage = () => {
                     }} /></div>
                     <div><label>Grand Total</label><strong>₦{grandTotal.toFixed(2)}</strong></div>
                 </div>
-                <button type="button" disabled={isSaving} onClick={() => void completeSale()}>{isSaving ? "Completing..." : "Complete Sale"}</button>
+                <button type="button" disabled={isSaving || isDraftSaving || Boolean(editingSaleItemId)} onClick={() => void completeSale()}>{isSaving ? "Completing..." : "Complete Sale"}</button>
                 <button type="button" onClick={clearSale}>Clear Sale</button>
             </div>
 

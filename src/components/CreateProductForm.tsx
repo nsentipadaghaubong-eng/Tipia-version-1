@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import type { Product, FormData, Variant, PackagingUnit } from "../types/Product";
 import { getCurrentStockForProduct } from "../database/database";
+import { validatePackagingChain, type PackagingChainValidationError } from "../domain/packagingChainValidation";
 import { formatExpiryStatus } from "../utils/expiry";
 
 interface InitialStockEntry {
@@ -16,7 +17,7 @@ interface InitialStockEntry {
 export interface CreateProductFormProps {
     existingProducts: Product[];
     initialProduct?: Product | null;
-    onSave: (product: Product, initialStock: InitialStockEntry[]) => Promise<void> | void;
+    onSave: (product: Product, initialStock: InitialStockEntry[], editReason?: string) => Promise<void> | void;
     onCancel: () => void;
     onUseExistingProduct?: (product: Product) => void;
     onModifyExistingProduct?: (product: Product) => void;
@@ -32,6 +33,23 @@ interface DuplicateMatchResult {
     nameMatches: Product[];
     barcodeMatches: Product[];
 }
+
+const formatPackagingChainError = (error: PackagingChainValidationError) => {
+    switch (error.code) {
+        case "missing-unit-name":
+            return "Every packaging unit must have a name";
+        case "smallest-unit-contains-another":
+            return `The smallest packaging unit (${error.packagingUnitName}) cannot contain another unit.`;
+        case "invalid-contains-quantity":
+            return `Enter a valid contains quantity for ${error.packagingUnitName || "packaging unit"}`;
+        case "missing-contains-unit":
+            return `Select what ${error.packagingUnitName || "packaging unit"} contains`;
+        case "unit-contains-itself":
+            return `${error.packagingUnitName || "This packaging unit"} cannot contain itself.`;
+        case "contains-unit-is-not-next":
+            return `${error.packagingUnitName || "This packaging unit"} must contain ${error.nextPackagingUnitName || "the next packaging unit"}.`;
+    }
+};
 
 const normalizeProductName = (value: string) => value.replace(/\s+/g, " ").trim().toLowerCase();
 const normalizeBarcodeValue = (value: string) => value.replace(/\s+/g, "").trim().toLowerCase();
@@ -174,6 +192,7 @@ const CreateProductForm = ({
     const [variants, setVariants] = useState<Variant[]>([createInitialVariant()]);
     const [isMultiVariant, setIsMultiVariant] = useState<boolean>(false);
     const [initialStock, setInitialStock] = useState<InitialStockEntry[]>([]);
+    const [editReason, setEditReason] = useState("");
     const [error, setError] = useState("");
     const [duplicateMatch, setDuplicateMatch] = useState<DuplicateMatchResult | null>(null);
     const [dismissedDuplicateKey, setDismissedDuplicateKey] = useState<string | null>(null);
@@ -186,6 +205,7 @@ const CreateProductForm = ({
             setVariants([createInitialVariant()]);
             setIsMultiVariant(false);
             setInitialStock([]);
+            setEditReason("");
             setError("");
             setDuplicateMatch(null);
             setDismissedDuplicateKey(null);
@@ -209,6 +229,7 @@ const CreateProductForm = ({
         const nextVariants = initialProduct.variants.length > 0 ? initialProduct.variants : [createInitialVariant()];
         setVariants(nextVariants);
         setIsMultiVariant(initialProduct.variants.length > 1);
+        setEditReason("");
         let cancelled = false;
 
         const loadCurrentStock = async () => {
@@ -528,6 +549,12 @@ const CreateProductForm = ({
             return;
         }
 
+        const trimmedEditReason = editReason.trim();
+        if (isEditing && !trimmedEditReason) {
+            setError("An edit reason is required");
+            return;
+        }
+
         const trimmedBarcode = (form.barcode ?? "").trim();
         const candidate: Product = {
             id: initialProduct?.id ?? crypto.randomUUID(),
@@ -568,45 +595,10 @@ const CreateProductForm = ({
         }
 
         for (const variant of variants) {
-            const packagingUnits = variant.packagingUnits;
-
-            for (let index = 0; index < packagingUnits.length; index++) {
-                const unit = packagingUnits[index];
-
-                if (!unit.name.trim()) {
-                    setError("Every packaging unit must have a name");
-                    return;
-                }
-
-                const isSmallestUnit = index === packagingUnits.length - 1;
-                if (isSmallestUnit) {
-                    if (unit.contains) {
-                        setError(`The smallest packaging unit (${unit.name}) cannot contain another unit.`);
-                        return;
-                    }
-                    continue;
-                }
-
-                if (!unit.contains?.quantity || unit.contains.quantity <= 0) {
-                    setError(`Enter a valid contains quantity for ${unit.name || "packaging unit"}`);
-                    return;
-                }
-
-                if (!unit.contains.unitId) {
-                    setError(`Select what ${unit.name || "packaging unit"} contains`);
-                    return;
-                }
-
-                if (unit.contains.unitId === unit.id) {
-                    setError(`${unit.name || "This packaging unit"} cannot contain itself.`);
-                    return;
-                }
-
-                const nextSmallerUnit = packagingUnits[index + 1];
-                if (unit.contains.unitId !== nextSmallerUnit.id) {
-                    setError(`${unit.name || "This packaging unit"} must contain ${nextSmallerUnit.name || "the next packaging unit"}.`);
-                    return;
-                }
+            const validation = validatePackagingChain(variant.packagingUnits);
+            if (!validation.valid) {
+                setError(formatPackagingChainError(validation.error));
+                return;
             }
         }
 
@@ -634,7 +626,7 @@ const CreateProductForm = ({
 
         try {
             setError("");
-            await onSave(savedProduct, initialStock);
+            await onSave(savedProduct, initialStock, isEditing ? trimmedEditReason : undefined);
         } catch (submitError) {
             console.error(submitError);
             setError(submitError instanceof Error ? submitError.message : "Something went wrong while saving the product");
@@ -811,6 +803,18 @@ const CreateProductForm = ({
                 <option value="active">Active</option>
                 <option value="archived">Archived</option>
             </select>
+
+            {isEditing && (
+                <>
+                    <label htmlFor="product-edit-reason">Edit reason *:</label>
+                    <textarea
+                        id="product-edit-reason"
+                        value={editReason}
+                        onChange={(event) => setEditReason(event.target.value)}
+                        required
+                    />
+                </>
+            )}
 
             <h4>2. {isEditing ? "Current Stock" : "Initial Stock"}</h4>
             {variants.map((variant, index) => {

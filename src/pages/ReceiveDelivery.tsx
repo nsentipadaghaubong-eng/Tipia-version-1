@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { Product, Delivery, DeliveryItems } from "../types/Product";
 import CreateProductForm from "../components/CreateProductForm";
@@ -53,6 +53,24 @@ const ReceiveDelivery = () => {
     const [historyExpanded, setHistoryExpanded] = useState(false);
     const [historySearch, setHistorySearch] = useState("");
     const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
+    const [editingDeliveryItemId, setEditingDeliveryItemId] = useState<string | null>(null);
+    const draftWriteQueue = useRef<Promise<void>>(Promise.resolve());
+
+    const persistDeliverySnapshot = (snapshot: Delivery) => {
+        const operation = draftWriteQueue.current.then(async () => {
+            await saveDeliveryDraft({ ...snapshot, status: "draft" });
+            window.dispatchEvent(new Event(PENDING_TASKS_CHANGED_EVENT));
+        });
+        draftWriteQueue.current = operation.then(() => undefined, () => undefined);
+        return operation;
+    };
+
+    const updateDeliveryDraft = (nextDelivery: Delivery) => {
+        setDelivery(nextDelivery);
+        void persistDeliverySnapshot(nextDelivery).catch((saveError) => {
+            setError(saveError instanceof Error ? saveError.message : "Failed to save the delivery draft.");
+        });
+    };
 
     const fetchSavedDeliveries = async (draftIdToLoad?: string, loadDraft = true) => {
         const deliveriesFromDB = await getDeliveries();
@@ -165,6 +183,19 @@ const ReceiveDelivery = () => {
         }));
     };
 
+    const editDeliveryItem = (deliveryItem: DeliveryItems) => {
+        setItem({ ...deliveryItem });
+        setEditingDeliveryItemId(deliveryItem.id);
+        setProductSearch("");
+        setError("");
+    };
+
+    const cancelDeliveryItemEdit = () => {
+        setItem(initialDeliveryItem);
+        setEditingDeliveryItemId(null);
+        setProductSearch("");
+    };
+
     const addItemToDelivery = async () => {
         if (!item.productId) {
             setError("Please search and select a product first");
@@ -205,7 +236,7 @@ const ReceiveDelivery = () => {
         }
 
         const newItem: DeliveryItems = {
-            id: crypto.randomUUID(),
+            id: editingDeliveryItemId ?? crypto.randomUUID(),
             deliveryId: delivery.id,
             productId: item.productId.trim(),
             variantId: item.variantId,
@@ -217,30 +248,41 @@ const ReceiveDelivery = () => {
             sellingPrice: item.sellingPrice,
         };
 
+        const nextItems = editingDeliveryItemId
+            ? delivery.items.map((existingItem) => existingItem.id === editingDeliveryItemId ? newItem : existingItem)
+            : [...delivery.items, newItem];
         const nextDelivery: Delivery = {
             ...delivery,
             status: "draft",
-            items: [...delivery.items, newItem],
+            items: nextItems,
         };
 
         try {
-            await saveDeliveryDraft(nextDelivery);
+            await persistDeliverySnapshot(nextDelivery);
             setDelivery(nextDelivery);
             setItem(initialDeliveryItem);
+            setEditingDeliveryItemId(null);
             setError("");
             await fetchSavedDeliveries(undefined, false);
-            window.dispatchEvent(new Event(PENDING_TASKS_CHANGED_EVENT));
         } catch (saveError) {
             console.error("Failed to persist delivery draft:", saveError);
             setError("Failed to save the current draft. Please try again.");
         }
     };
 
-    function removeItemFromDelivery(id: string) {
-        setDelivery((previousDelivery) => ({
-            ...previousDelivery,
-            items: previousDelivery.items.filter((item) => item.id !== id),
-        }));
+    async function removeItemFromDelivery(id: string) {
+        if (editingDeliveryItemId === id) cancelDeliveryItemEdit();
+        const nextDelivery = {
+            ...delivery,
+            items: delivery.items.filter((item) => item.id !== id),
+        };
+        setDelivery(nextDelivery);
+        try {
+            await persistDeliverySnapshot(nextDelivery);
+            setError("");
+        } catch (saveError) {
+            setError(saveError instanceof Error ? saveError.message : "Failed to save the delivery draft.");
+        }
     }
 
     async function validateDelivery() {
@@ -277,6 +319,7 @@ const ReceiveDelivery = () => {
                 status: "approved",
             };
 
+            await draftWriteQueue.current;
             await receiveDelivery(approvedDelivery);
             window.dispatchEvent(new Event(INVENTORY_CHANGED_EVENT));
 
@@ -285,6 +328,7 @@ const ReceiveDelivery = () => {
 
             setDelivery(createNewDeliveryState());
             setItem(initialDeliveryItem);
+            setEditingDeliveryItemId(null);
             setProductSearch("");
             setError("");
         } catch (deliveryError) {
@@ -323,7 +367,7 @@ const ReceiveDelivery = () => {
                         type="text"
                         value={delivery.supplier}
                         placeholder="Enter supplier name"
-                        onChange={(e) => setDelivery({ ...delivery, supplier: e.target.value })}
+                        onChange={(e) => updateDeliveryDraft({ ...delivery, supplier: e.target.value })}
                     />
                 </div>
 
@@ -332,7 +376,7 @@ const ReceiveDelivery = () => {
                     <input
                         type="text"
                         value={delivery.invoiceNo}
-                        onChange={(e) => setDelivery({ ...delivery, invoiceNo: e.target.value })}
+                        onChange={(e) => updateDeliveryDraft({ ...delivery, invoiceNo: e.target.value })}
                     />
                 </div>
 
@@ -341,7 +385,7 @@ const ReceiveDelivery = () => {
                     <input
                         type="date"
                         value={delivery.date}
-                        onChange={(e) => setDelivery({ ...delivery, date: e.target.value })}
+                        onChange={(e) => updateDeliveryDraft({ ...delivery, date: e.target.value })}
                     />
                 </div>
 
@@ -350,7 +394,7 @@ const ReceiveDelivery = () => {
                     <input
                         type="text"
                         value={delivery.receivedBy}
-                        onChange={(e) => setDelivery({ ...delivery, receivedBy: e.target.value })}
+                        onChange={(e) => updateDeliveryDraft({ ...delivery, receivedBy: e.target.value })}
                     />
                 </div>
             </div>
@@ -401,9 +445,9 @@ const ReceiveDelivery = () => {
                     <CreateProductForm
                         existingProducts={products}
                         initialProduct={editingExistingProduct}
-                        onSave={async (savedProduct, stockEntries) => {
+                        onSave={async (savedProduct, stockEntries, editReason) => {
                             if (editingExistingProduct) {
-                                await updateProduct(savedProduct);
+                                await updateProduct(savedProduct, editReason ?? "", stockEntries);
                                 const refreshedProducts = await getProducts();
                                 setProducts(refreshedProducts);
                                 setShowCreateProduct(false);
@@ -552,8 +596,11 @@ const ReceiveDelivery = () => {
                     </div>
 
                     <button type="button" onClick={addItemToDelivery}>
-                        Add to Delivery
+                        {editingDeliveryItemId ? "Update Delivery Item" : "Add to Delivery"}
                     </button>
+                    {editingDeliveryItemId && (
+                        <button type="button" onClick={cancelDeliveryItemEdit}>Cancel Item Edit</button>
+                    )}
                 </div>
             )}
 
@@ -575,12 +622,15 @@ const ReceiveDelivery = () => {
                         <button type="button" onClick={() => removeItemFromDelivery(delItem.id)}>
                             Remove
                         </button>
+                        <button type="button" onClick={() => editDeliveryItem(delItem)}>
+                            Edit
+                        </button>
                     </div>
                 );
             })}
 
             <div style={{ display: "flex", gap: 12 }}>
-                <button type="button" onClick={validateDelivery}>
+                <button type="button" disabled={Boolean(editingDeliveryItemId)} onClick={validateDelivery}>
                     Approve Delivery
                 </button>
             </div>
@@ -620,10 +670,12 @@ const ReceiveDelivery = () => {
                                                         ...saved,
                                                         status: "draft",
                                                     });
+                                                    setEditingDeliveryItemId(null);
+                                                    setItem(initialDeliveryItem);
                                                     setSelectedHistoryId(saved.id);
                                                 }}
                                             >
-                                                Resume Draft
+                                                Edit
                                             </button>
                                         )}
                                     </div>

@@ -1,22 +1,35 @@
-const dateToUtcDay = (value: string) => {
-    const [year, month, day] = value.slice(0, 10).split("-").map(Number);
-    return Date.UTC(year, month - 1, day);
-};
+import {
+    classifyExpiry,
+    getDaysUntilExpiry as getDomainDaysUntilExpiry,
+} from "../domain/expirySemantics";
 
-export const getDaysUntilExpiry = (expiryDate: string, referenceDate = new Date()) => {
+export const getCurrentCalendarDate = (referenceDate = new Date()) => {
     const year = referenceDate.getFullYear();
     const month = String(referenceDate.getMonth() + 1).padStart(2, "0");
     const day = String(referenceDate.getDate()).padStart(2, "0");
-    const today = `${year}-${month}-${day}`;
-    return Math.round((dateToUtcDay(expiryDate) - dateToUtcDay(today)) / 86400000);
+    return `${year}-${month}-${day}`;
 };
 
-export const formatExpiryStatus = (expiryDate?: string | null) => {
-    if (!expiryDate) return "No expiry date";
+export const getDaysUntilExpiry = (
+    expiryDate: string,
+    referenceDate = new Date()
+): number => {
+    const daysUntilExpiry = getDomainDaysUntilExpiry(expiryDate, getCurrentCalendarDate(referenceDate));
+    if (daysUntilExpiry === null) {
+        throw new RangeError("Expiry and reference dates must be valid YYYY-MM-DD dates");
+    }
+    return daysUntilExpiry;
+};
 
-    const days = getDaysUntilExpiry(expiryDate);
-    if (days < 0) return `Expired ${Math.abs(days)} days ago`;
-    if (days === 0) return "Expires today";
-    if (days === 1) return "1 day left";
-    return `${days} days left`;
+export const formatExpiryStatus = (expiryDate?: string | null, referenceDate = new Date()) => {
+    const classification = classifyExpiry(expiryDate, getCurrentCalendarDate(referenceDate));
+
+    if (classification.state === "missing") return "No expiry date";
+    if (classification.state === "invalid") return "Invalid expiry date";
+    if (classification.state === "expired") {
+        return `Expired ${Math.abs(classification.daysUntilExpiry)} days ago`;
+    }
+    if (classification.state === "expiresToday") return "Expires today";
+    if (classification.daysUntilExpiry === 1) return "1 day left";
+    return `${classification.daysUntilExpiry} days left`;
 };

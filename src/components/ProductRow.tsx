@@ -1,16 +1,23 @@
 import type { Product } from "../types/Product";
-import { formatStockByPackagingHierarchy, type CurrentStockEntry } from "../database/database";
-import { getDaysUntilExpiry } from "../utils/expiry";
+import type { CurrentStockEntry } from "../database/database";
+import type { StockBreakdownEntry } from "../domain/stockBreakdown";
+import { classifyExpiry } from "../domain/expirySemantics";
+import { getCurrentCalendarDate } from "../utils/expiry";
 
 interface ProductRowProps {
     product: Product;
     stockEntries?: CurrentStockEntry[];
+    stockBreakdowns: Array<{ variantId: string; entries: StockBreakdownEntry[] }>;
     onView: (product: Product) => void;
     onUpdate: (product: Product) => void;
     onDelete: (product: Product) => void;
 }
 
-const formatStockSummary = (product: Product, stockEntries: CurrentStockEntry[] = []) => {
+const formatStockSummary = (
+    product: Product,
+    stockEntries: CurrentStockEntry[] = [],
+    stockBreakdowns: Array<{ variantId: string; entries: StockBreakdownEntry[] }>
+) => {
     if (stockEntries.length === 0) {
         return "No stock";
     }
@@ -20,10 +27,12 @@ const formatStockSummary = (product: Product, stockEntries: CurrentStockEntry[] 
         const variantEntries = stockEntries.filter((entry) => entry.variantId === variant.id);
         if (variantEntries.length === 0) continue;
 
-        const variantSummary = formatStockByPackagingHierarchy(variant, variantEntries.map((entry) => ({
-            packagingUnitId: entry.packagingUnitId,
-            quantity: entry.quantity,
-        })));
+        const breakdown = stockBreakdowns.find((entry) => entry.variantId === variant.id)?.entries ?? [];
+        const variantSummary = breakdown
+            .map(({ quantity, packagingUnitName }) =>
+                `${quantity} ${packagingUnitName || "unit"}${quantity === 1 ? "" : "s"}`
+            )
+            .join(" + ") || "0";
         summaries.push(variantSummary);
     }
 
@@ -40,16 +49,27 @@ const formatExpirySummary = (stockEntries: CurrentStockEntry[] = []) => {
     }
 
     const earliest = [...new Set(validDates)].sort()[0];
-    const days = getDaysUntilExpiry(earliest);
+    const classification = classifyExpiry(earliest, getCurrentCalendarDate());
 
-    if (days < 0) return `Expired ${Math.abs(days)} days ago`;
-    if (days === 0) return "Expires today";
-    if (days === 1) return "1 day left";
-    return `${days} days left`;
+    if (classification.state === "invalid") return "Invalid expiry date";
+    if (classification.state === "expired") {
+        return `Expired ${Math.abs(classification.daysUntilExpiry)} days ago`;
+    }
+    if (classification.state === "expiresToday") return "Expires today";
+    if (classification.state === "expiringSoon" || classification.state === "valid") {
+        if (classification.daysUntilExpiry === 1) return "1 day left";
+        return `${classification.daysUntilExpiry} days left`;
+    }
+
+    return "No expiry tracked";
 };
 
 const ProductRow = (props: ProductRowProps) => {
-    const stockSummary = formatStockSummary(props.product, props.stockEntries ?? []);
+    const stockSummary = formatStockSummary(
+        props.product,
+        props.stockEntries ?? [],
+        props.stockBreakdowns
+    );
     const expirySummary = formatExpirySummary(props.stockEntries ?? []);
 
     return (

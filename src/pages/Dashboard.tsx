@@ -16,6 +16,7 @@ import { formatExpiryStatus, getDaysUntilExpiry } from "../utils/expiry";
 
 const emptySummary: DashboardSummary = {
     nearExpiry: [],
+    expiresToday: [],
     expired: [],
     lowStock: [],
     outOfStock: [],
@@ -24,13 +25,13 @@ const emptySummary: DashboardSummary = {
 const StockList = ({ lines, expired = false }: { lines: DashboardStockLine[]; expired?: boolean }) => (
     <div>
         {lines.length === 0 ? <p>No stock lines.</p> : lines.map((line) => {
-            const days = line.expiryDate ? getDaysUntilExpiry(line.expiryDate) : 0;
+            const days = line.expiryDate ? getDaysUntilExpiry(line.expiryDate) : null;
             return (
                 <div
                     key={line.id}
                     style={{
                         border: "1px solid #ddd",
-                        borderLeft: `4px solid ${expired || days <= 30 ? "#c62828" : "#e0a000"}`,
+                        borderLeft: `4px solid ${expired || (days !== null && days <= 30) ? "#c62828" : "#e0a000"}`,
                         padding: 10,
                         marginBottom: 8,
                     }}
@@ -57,6 +58,42 @@ const QuantityList = ({ entries, emptyLabel }: { entries: DashboardQuantity[]; e
         ))}
     </div>
 );
+
+type DashboardSummaryCard = { key: keyof DashboardSummary; label: string; value: number };
+
+export const DashboardSummaryCards = ({
+    summary,
+    onToggle,
+}: {
+    summary: DashboardSummary;
+    onToggle: (key: keyof DashboardSummary) => void;
+}) => {
+    const cards: DashboardSummaryCard[] = [
+        { key: "nearExpiry", label: "Near Expiry", value: summary.nearExpiry.length },
+        ...(summary.expiresToday.length > 0
+            ? [{ key: "expiresToday" as const, label: "Expires Today", value: summary.expiresToday.length }]
+            : []),
+        { key: "expired", label: "Already Expired", value: summary.expired.length },
+        { key: "lowStock", label: "Low Stock", value: summary.lowStock.length },
+        { key: "outOfStock", label: "Out of Stock", value: summary.outOfStock.length },
+    ];
+
+    return (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+            {cards.map((card) => (
+                <button
+                    key={card.key}
+                    type="button"
+                    onClick={() => onToggle(card.key)}
+                    style={{ textAlign: "left", padding: 16, border: "1px solid #ddd", background: "white", cursor: "pointer" }}
+                >
+                    <div>{card.label}</div>
+                    <strong style={{ fontSize: 28 }}>{card.value}</strong>
+                </button>
+            ))}
+        </div>
+    );
+};
 
 const Dashboard = () => {
     const navigate = useNavigate();
@@ -93,12 +130,6 @@ const Dashboard = () => {
         };
     }, []);
 
-    const cards: Array<{ key: keyof DashboardSummary; label: string; value: number }> = [
-        { key: "nearExpiry", label: "Near Expiry", value: summary.nearExpiry.length },
-        { key: "expired", label: "Already Expired", value: summary.expired.length },
-        { key: "lowStock", label: "Low Stock", value: summary.lowStock.length },
-        { key: "outOfStock", label: "Out of Stock", value: summary.outOfStock.length },
-    ];
     const showSection = (key: keyof DashboardSummary) => expanded === null || expanded === key;
 
     return (
@@ -113,52 +144,49 @@ const Dashboard = () => {
                 ) : (
                     <div>
                         {pendingDeliveries.map((delivery) => (
-                            <button
+                            <div
                                 key={`delivery-${delivery.id}`}
-                                type="button"
-                                onClick={() => navigate("/receive-delivery", {
-                                    state: { draftType: "delivery", draftId: delivery.id },
-                                })}
                             >
-                                <strong>Delivery — {delivery.supplier}</strong>
-                                <div>Invoice: {delivery.invoiceNo} | Items: {delivery.items.length} | Date: {delivery.date}</div>
-                            </button>
+                                <strong>Pending Delivery</strong>
+                                <button
+                                    type="button"
+                                    onClick={() => navigate("/receive-delivery", {
+                                        state: { draftType: "delivery", draftId: delivery.id },
+                                    })}
+                                >Continue Delivery</button>
+                            </div>
                         ))}
                         {pendingSales.map((sale) => (
-                            <button
+                            <div
                                 key={`sale-${sale.id}`}
-                                type="button"
-                                onClick={() => navigate("/sales-page", {
-                                    state: { draftType: "sale", draftId: sale.id },
-                                })}
                             >
-                                <strong>Sale — {sale.items.length} item{sale.items.length === 1 ? "" : "s"}</strong>
-                                <div>Total: ₦{sale.totalAmount.toLocaleString()} | Date: {sale.date}</div>
-                            </button>
+                                <strong>Pending Sale</strong>
+                                <button
+                                    type="button"
+                                    onClick={() => navigate("/sales-page", {
+                                        state: { draftType: "sale", draftId: sale.id },
+                                    })}
+                                >Continue Sale</button>
+                            </div>
                         ))}
                     </div>
                 )}
             </section>
 
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
-                {cards.map((card) => (
-                    <button
-                        key={card.key}
-                        type="button"
-                        onClick={() => setExpanded(expanded === card.key ? null : card.key)}
-                        style={{ textAlign: "left", padding: 16, border: "1px solid #ddd", background: "white", cursor: "pointer" }}
-                    >
-                        <div>{card.label}</div>
-                        <strong style={{ fontSize: 28 }}>{card.value}</strong>
-                    </button>
-                ))}
-            </div>
+            <DashboardSummaryCards
+                summary={summary}
+                onToggle={(key) => setExpanded(expanded === key ? null : key)}
+            />
 
             {error && <p>{error}</p>}
 
             {showSection("nearExpiry") && <section>
                 <h2>Near Expiry</h2>
                 <StockList lines={summary.nearExpiry} />
+            </section>}
+            {showSection("expiresToday") && <section>
+                <h2>Expires Today</h2>
+                <StockList lines={summary.expiresToday} />
             </section>}
             {showSection("expired") && <section>
                 <h2>Already Expired</h2>

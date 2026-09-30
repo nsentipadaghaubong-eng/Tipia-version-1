@@ -1,10 +1,83 @@
-import Database from "@tauri-apps/plugin-sql";
+import { loadDatabase, type SqliteDatabase } from "./connection";
+import {
+    getConversionFactor,
+    getSmallestPackagingUnit as getSmallestPackagingUnitFromHierarchy,
+} from "../domain/stockBreakdown";
+import { classifyExpiry, isValidExpiryDate } from "../domain/expirySemantics";
+import { getProductActivityChanges } from "../domain/productActivityChanges";
+export { getConversionFactor } from "../domain/stockBreakdown";
+import { recordActivity } from "./activity";
+import { getActivityRecords } from "./activityRepository";
+import {
+    getProducts as getProductCatalog,
+    mapProductToRow,
+    saveProductHierarchy,
+    insertProductRow,
+    updateProductRow,
+    archiveProductRow,
+    getProductActivitySnapshot,
+    selectNonArchivedProductIdsById,
+    selectVariantIdsByProductId,
+    selectVariantIdByIdAndProductId,
+    insertVariantRow,
+    updateVariantRow,
+    deleteVariantRow,
+    deletePackagingUnitsByVariantId,
+    selectPackagingUnitIdsByVariantId,
+    selectPackagingUnitIdByIdAndVariantId,
+    selectPackagingUnitIdsContainingUnit,
+    deletePackagingUnitRow,
+    insertPackagingUnitRow,
+    updatePackagingUnitRow,
+    getPackagingUnitsForVariant,
+} from "./productRepository";
+import {
+    addInventoryStock,
+    applyInventoryStockAllocation,
+    setInventoryStockEntry,
+} from "./inventory";
+import {
+    getInventoryStockRowsForVariant,
+    mapInventoryStockRow,
+    getInventoryStockReferencesByVariant,
+    getInventoryStockReferencesByPackagingUnit,
+    getInventoryStockQuantitiesByVariant,
+    selectInventoryStockRowsByVariant,
+    selectRawInventoryStockRows,
+} from "./inventoryRepository";
+import {
+    createDelivery as createDeliveryRow,
+    createDeliveryItem as createDeliveryItemRow,
+    getDeliveryRows,
+    getDeliveryRowById,
+    selectDeliveryIdsById,
+    insertDeliveryRowWithStatus,
+    updateDeliveryRow,
+    deleteDeliveryItemsByDeliveryId,
+    insertDeliveryItemRow,
+    getDeliveryItemReferencesByVariant,
+    getDeliveryItemReferencesByPackagingUnit,
+} from "./deliveryRepository";
+import {
+    getSaleRows,
+    getSaleRowById,
+    selectSaleIdsById,
+    selectSaleIdsByIdAndStatus,
+    insertSaleRow,
+    updateSaleRow,
+    deleteSaleItemsBySaleId,
+    deleteSaleDraftById,
+    insertSaleItemRow,
+    insertSaleItemRowWithAllocation,
+} from "./salesRepository";
 import {
     product1, product2, product3, product4, product5, product6, product7,
     product8, product9, product10
 } from "../components/ProductList";
-import { Product, ProductRow, PackagingUnit, PackagingUnitRow, Delivery, DeliveryItems, Variant, Sale, SaleItem } from "../types/Product";
-import { getDaysUntilExpiry } from "../utils/expiry";
+import { Product, PackagingUnit, Delivery, DeliveryItems, Variant, Sale, SaleItem } from "../types/Product";
+import { getCurrentCalendarDate, getDaysUntilExpiry } from "../utils/expiry";
+import { calculateSaleLineAmount } from "../domain/saleCalculations";
+import type { InventoryAdjustmentInput, InventoryStockValues } from "../types/Inventory";
 
 export type InventoryStockEntryInput = {
     id?: string;
@@ -22,6 +95,12 @@ export type CurrentStockEntry = Omit<InventoryStockEntryInput, "id" | "variantId
     variantId: string;
 };
 
+const getActivityVariantLabel = (variant: Variant | undefined) => {
+    if (!variant) return null;
+    const strength = [variant.strength, variant.strengthUnit].filter(Boolean).join(" ");
+    return [strength, variant.form].filter(Boolean).join(" ") || "Variant";
+};
+
 export const INVENTORY_CHANGED_EVENT = "tipia:inventory-changed";
 export const PENDING_TASKS_CHANGED_EVENT = "tipia:pending-tasks-changed";
 
@@ -30,49 +109,8 @@ const products = [
     product6, product7, product8, product9, product10
 ];
 
-const mapProductToRow = (product: Product): ProductRow => {
-    return {
-        ...product,
-        nafdacNumber: product.nafdacNumber ?? "",
-        trackBatches: product.trackBatches ? 1 : 0,
-        trackExpiry: product.trackExpiry ? 1 : 0,
-    };
-};
-
-const mapRowToProduct = (row: ProductRow): Product => {
-    return {
-        ...row,
-        nafdacNumber: row.nafdacNumber ?? "",
-        barcode: row.barcode ?? "",
-        sku: row.sku ?? "",
-        lowStockLevel: row.lowStockLevel ?? 5,
-        trackBatches: Boolean(row.trackBatches),
-        trackExpiry: Boolean(row.trackExpiry),
-        status: row.status ?? "active",
-        createdAt: row.createdAt ?? undefined,
-        variants: [],
-    };
-};
-
-const mapRowToPackagingUnit = (row: PackagingUnitRow): PackagingUnit => {
-    return {
-        id: row.id,
-        name: row.name,
-        contains:
-            row.containsQuantity !== null && row.containsUnitId !== null
-                ? {
-                    quantity: row.containsQuantity,
-                    unitId: row.containsUnitId
-                }
-                : undefined,
-        costPrice: row.costPrice ?? undefined,
-        sellingPrice: row.sellingPrice ?? undefined,
-        isDefault: Boolean(row.isDefault),
-    };
-};
-
 export const initializeDatabase = async () => {
-    const db = await Database.load("sqlite:tipia.db");
+    const db = await loadDatabase();
 
     await db.execute(`PRAGMA foreign_keys = ON;`);
 
@@ -250,6 +288,31 @@ export const initializeDatabase = async () => {
         )
     `);
 
+    await db.execute(`
+        CREATE TABLE IF NOT EXISTS activities (
+            id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            entity_label TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            reason TEXT,
+            changes TEXT,
+            details TEXT
+        )
+    `);
+
+    const activityColumns = await db.select<Array<{ name: string }>>(
+        `PRAGMA table_info(activities)`
+    );
+    if (!activityColumns.some((column) => column.name === "changes")) {
+        await db.execute(`ALTER TABLE activities ADD COLUMN changes TEXT`);
+    }
+    if (!activityColumns.some((column) => column.name === "details")) {
+        await db.execute(`ALTER TABLE activities ADD COLUMN details TEXT`);
+    }
+
     // Seed data: Product -> Variant -> PackagingUnit
     for (const product of products) {
         const row = mapProductToRow(product);
@@ -325,60 +388,15 @@ export const initializeDatabase = async () => {
 };
 
 export const getCurrentStockForProduct = async (productId: string): Promise<CurrentStockEntry[]> => {
-    const db = await Database.load("sqlite:tipia.db");
+    const db = await loadDatabase();
+    const rows = await selectRawInventoryStockRows(db, { productId });
 
-    const rows = await db.select<Array<{
-        id: string;
-        variantId: string;
-        packagingUnitId: string;
-        quantity: number;
-        batchNumber: string | null;
-        expiryDate: string | null;
-        costPrice: number;
-        sellingPrice: number;
-    }>>(`
-        SELECT
-            id,
-            variant_id AS variantId,
-            packaging_unit_id AS packagingUnitId,
-            quantity,
-            batch_number AS batchNumber,
-            expiry_date AS expiryDate,
-            cost_price AS costPrice,
-            selling_price AS sellingPrice
-        FROM inventory_stock
-        WHERE product_id = ?
-        ORDER BY variant_id, packaging_unit_id, expiry_date ASC, id ASC
-    `, [productId]);
-
-    return rows.map((row) => ({
-        id: row.id,
-        variantId: row.variantId,
-        packagingUnitId: row.packagingUnitId,
-        quantity: row.quantity,
-        batchNumber: row.batchNumber ?? undefined,
-        expiryDate: row.expiryDate ?? undefined,
-        costPrice: row.costPrice,
-        sellingPrice: row.sellingPrice,
-    }));
+    return rows.map((row) => mapInventoryStockRow(row));
 };
 
 export const getCurrentStockForAllProducts = async (): Promise<Record<string, CurrentStockEntry[]>> => {
-    const db = await Database.load("sqlite:tipia.db");
-    const rows = await db.select<Array<CurrentStockEntry & { productId: string }>>(`
-        SELECT
-            id,
-            product_id AS productId,
-            variant_id AS variantId,
-            packaging_unit_id AS packagingUnitId,
-            quantity,
-            batch_number AS batchNumber,
-            expiry_date AS expiryDate,
-            cost_price AS costPrice,
-            selling_price AS sellingPrice
-        FROM inventory_stock
-        ORDER BY product_id, variant_id, packaging_unit_id, expiry_date ASC, id ASC
-    `);
+    const db = await loadDatabase();
+    const rows = await selectRawInventoryStockRows(db);
 
     return rows.reduce<Record<string, CurrentStockEntry[]>>((stockByProduct, row) => {
         const { productId, ...stockEntry } = row;
@@ -397,106 +415,19 @@ export const getAvailableStockRowsForVariant = async (
     preferredBatchNumber?: string,
     preferredExpiryDate?: string
 ): Promise<StockRowForSale[]> => {
-    const db = await Database.load("sqlite:tipia.db");
+    const rows = await getInventoryStockRowsForVariant(productId, variantId, preferredBatchNumber, preferredExpiryDate);
 
-    const rows = await db.select<StockRowForSale[]>(`
-        SELECT
-            id,
-            product_id AS productId,
-            variant_id AS variantId,
-            packaging_unit_id AS packagingUnitId,
-            quantity,
-            batch_number AS batchNumber,
-            expiry_date AS expiryDate,
-            cost_price AS costPrice,
-            selling_price AS sellingPrice
-        FROM inventory_stock
-        WHERE product_id = ?
-          AND variant_id = ?
-          AND quantity > 0
-    `, [productId, variantId]);
-
-    return rows.filter((row) => {
-        if (preferredBatchNumber && (row.batchNumber ?? "") !== preferredBatchNumber) {
-            return false;
-        }
-        if (preferredExpiryDate && (row.expiryDate ?? "") !== preferredExpiryDate) {
-            return false;
-        }
-        return true;
-    });
-};
-
-export const formatStockByPackagingHierarchy = (
-    variant: Variant,
-    stockEntries: Array<{ packagingUnitId: string; quantity: number }>
-): string => {
-    if (!variant.packagingUnits.length || stockEntries.length === 0) {
-        return "0";
-    }
-
-    const smallestUnit = getSmallestPackagingUnit(variant);
-    if (!smallestUnit) {
-        return "0";
-    }
-
-    const totalSmallestUnits = stockEntries.reduce((total, entry) => {
-        const unit = variant.packagingUnits.find((item) => item.id === entry.packagingUnitId);
-        if (!unit) return total;
-        return total + entry.quantity * getConversionFactor(unit.id, smallestUnit.id, variant.packagingUnits);
-    }, 0);
-
-    if (totalSmallestUnits === 0) {
-        return `0 ${smallestUnit.name || "unit"}s`;
-    }
-
-    const orderedUnits = variant.packagingUnits.slice();
-    let remainingSmallestUnits = totalSmallestUnits;
-    const quantitiesByUnit = new Map<string, number>();
-
-    for (const unit of orderedUnits) {
-        const factorToSmallest = getConversionFactor(unit.id, smallestUnit.id, variant.packagingUnits);
-        const count = Math.floor(remainingSmallestUnits / factorToSmallest);
-        if (count <= 0) {
-            continue;
-        }
-
-        quantitiesByUnit.set(unit.id, count);
-        remainingSmallestUnits -= count * factorToSmallest;
-    }
-
-    const parts = orderedUnits
-        .map((unit) => {
-            const count = quantitiesByUnit.get(unit.id) ?? 0;
-            if (count <= 0) return null;
-            return `${count} ${unit.name || "unit"}${count === 1 ? "" : "s"}`;
-        })
-        .filter((value): value is string => Boolean(value));
-
-    if (remainingSmallestUnits > 0) {
-        const smallestCount = remainingSmallestUnits;
-        parts.push(`${smallestCount} ${smallestUnit.name || "unit"}${smallestCount === 1 ? "" : "s"}`);
-    }
-
-    if (parts.length === 0) {
-        return `${totalSmallestUnits} ${smallestUnit.name || "unit"}${totalSmallestUnits === 1 ? "" : "s"}`;
-    }
-
-    return parts.join(" + ");
+    return rows as StockRowForSale[];
 };
 
 export const getVariantAvailabilityByPackagingUnit = async (
     productId: string,
     variantId: string
 ): Promise<Array<{ unitId: string; unitName: string; quantity: number }>> => {
-    const db = await Database.load("sqlite:tipia.db");
+    const db = await loadDatabase();
     const packagingUnits = await getPackagingUnitsForVariant(db, variantId);
 
-    const stockRows = await db.select<Array<{ packagingUnitId: string; quantity: number }>>(`
-        SELECT packaging_unit_id AS packagingUnitId, quantity
-        FROM inventory_stock
-        WHERE product_id = ? AND variant_id = ? AND quantity > 0
-    `, [productId, variantId]);
+    const stockRows = await selectInventoryStockRowsByVariant(db, productId, variantId);
 
     return packagingUnits.map((unit) => ({
         unitId: unit.id,
@@ -531,122 +462,11 @@ export const getExpirySummary = (stockEntries: Array<{ expiryDate?: string }>) =
     };
 };
 
-export const getProducts = async () => {
-    const db = await Database.load("sqlite:tipia.db");
+export const getProducts = async () => getProductCatalog();
 
-    const productRows = await db.select<ProductRow[]>(`
-        SELECT 
-            id, name, generic_name AS genericName, category, manufacturer,
-            nafdac_number AS nafdacNumber,
-            barcode, sku, low_stock_level AS lowStockLevel,
-            track_batches AS trackBatches, track_expiry AS trackExpiry, status,
-            created_at AS createdAt
-        FROM products
-        ORDER BY created_at IS NULL, created_at DESC, id DESC
-    `);
-
-    const variantRows = await db.select<Array<{
-        id: string;
-        productId: string;
-        strength: string;
-        strengthUnit: string;
-        form: string;
-    }>>(`
-        SELECT 
-            id, product_id AS productId, strength, strength_unit AS strengthUnit, form
-        FROM variants
-    `);
-
-    const packagingRows = await db.select<PackagingUnitRow[]>(`
-    SELECT
-        id,
-        variant_id AS variantId,
-        name,
-        level,
-        contains_quantity AS containsQuantity,
-        contains_unit_id AS containsUnitId,
-        cost_price AS costPrice,
-        selling_price AS sellingPrice,
-        is_default AS isDefault
-    FROM packaging_units
-    ORDER BY variant_id, level ASC
-`);
-    return productRows.map((pRow) => {
-        const product = mapRowToProduct(pRow);
-
-        const variants = variantRows
-            .filter((v) => v.productId === product.id)
-            .map((v) => {
-                const packagingUnits = packagingRows
-                    .filter((u) => u.variantId === v.id)
-                    .map(mapRowToPackagingUnit);
-
-                return {
-                    id: v.id,
-                    productId: v.productId,
-                    strength: v.strength,
-                    strengthUnit: v.strengthUnit,
-                    form: v.form,
-                    packagingUnits,
-                };
-            });
-
-        return {
-            ...product,
-            variants: variants,
-        };
-    });
-};
-
-type SqliteDatabase = Awaited<ReturnType<typeof Database.load>>;
-
-const saveProductHierarchy = async (
-    db: SqliteDatabase,
-    product: Product
-) => {
-    for (const variant of product.variants ?? []) {
-        await db.execute(`
-            INSERT INTO variants(
-                id, product_id, strength, strength_unit, form
-            )
-            VALUES(?, ?, ?, ?, ?)
-        `, [
-            variant.id,
-            product.id,
-            variant.strength ?? "",
-            variant.strengthUnit ?? "",
-            variant.form ?? "",
-        ]);
-
-        for (let level = 0; level < (variant.packagingUnits ?? []).length; level++) {
-            const unit = variant.packagingUnits[level];
-
-            await db.execute(`
-        INSERT INTO packaging_units(
-            id,
-            variant_id,
-            name,
-            level,
-            contains_quantity,
-            contains_unit_id,
-            cost_price,
-            selling_price,
-            is_default
-        )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-                unit.id,
-                variant.id,
-                unit.name,
-                level + 1,
-                unit.contains?.quantity ?? null,
-                unit.contains?.unitId ?? null,
-                unit.costPrice ?? null,
-                unit.sellingPrice ?? null,
-                unit.isDefault ? 1 : 0,
-            ]);
-        }
-    }
+export const getActivities = async () => {
+    const db = await loadDatabase();
+    return getActivityRecords(db);
 };
 
 export const createProduct = async (
@@ -661,48 +481,14 @@ export const createProduct = async (
         sellingPrice: number;
     }> = []
 ) => {
-    const db = await Database.load("sqlite:tipia.db");
+    const db = await loadDatabase();
 
     try {
         await db.execute(`PRAGMA foreign_keys = ON;`);
         await db.execute(`BEGIN`);
 
-        const row = mapProductToRow(product);
-
         const createdAt = new Date().toISOString();
-
-        await db.execute(`
-            INSERT INTO products(
-                id,
-                name,
-                generic_name,
-                category,
-                manufacturer,
-                nafdac_number,
-                barcode,
-                sku,
-                low_stock_level,
-                track_batches,
-                track_expiry,
-                status,
-                created_at
-            )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, [
-            row.id,
-            row.name,
-            row.genericName,
-            row.category,
-            row.manufacturer,
-            row.nafdacNumber,
-            row.barcode,
-            row.sku,
-            row.lowStockLevel,
-            row.trackBatches,
-            row.trackExpiry,
-            row.status,
-            createdAt,
-        ]);
+        await insertProductRow(db, product, createdAt);
 
         // Create variants and packaging units first
         await saveProductHierarchy(db, product);
@@ -722,9 +508,7 @@ export const createProduct = async (
                 );
             }
 
-            await addStock(db, {
-                id: stock.id,
-                deliveryId: "",
+            await addInventoryStock(db, {
                 productId: product.id,
                 variantId: variant.id,
                 packagingUnitId: stock.packagingUnitId,
@@ -735,6 +519,29 @@ export const createProduct = async (
                 sellingPrice: stock.sellingPrice,
             });
         }
+
+        await recordActivity(db, {
+            eventType: "product.created",
+            entityType: "product",
+            entityId: product.id,
+            entityLabel: product.name,
+            summary: `Product created: ${product.name}`,
+            reason: null,
+            details: {
+                genericName: product.genericName,
+                manufacturer: product.manufacturer,
+                category: product.category,
+                variants: product.variants.map((variant) => ({
+                    label: getActivityVariantLabel(variant) ?? "Variant",
+                    initialQuantities: stockEntries
+                        .filter((stock) => variant.packagingUnits.some((unit) => unit.id === stock.packagingUnitId))
+                        .map((stock) => ({
+                            quantity: stock.quantity,
+                            packagingUnitName: variant.packagingUnits.find((unit) => unit.id === stock.packagingUnitId)?.name ?? "Unit",
+                        })),
+                })),
+            },
+        });
 
         await db.execute(`COMMIT`);
 
@@ -749,60 +556,37 @@ export const createProduct = async (
     }
 };
 
-export const updateProduct = async (product: Product) => {
-    const db = await Database.load("sqlite:tipia.db");
-    const row = mapProductToRow(product);
+export const updateProduct = async (
+    product: Product,
+    editReason: string,
+    stockEntries: InventoryStockEntryInput[] = []
+) => {
+    const normalizedReason = editReason.trim();
+    if (!normalizedReason) {
+        throw new Error("An edit reason is required when updating a product");
+    }
+
+    const db = await loadDatabase();
 
     try {
         await db.execute(`PRAGMA foreign_keys = ON;`);
         await db.execute(`BEGIN`);
 
+        const existingProduct = await getProductActivitySnapshot(db, product.id);
+        if (!existingProduct) {
+            throw new Error(`Product ${product.id} does not exist`);
+        }
+        const stockBefore = await selectRawInventoryStockRows(db, { productId: product.id });
+
         // --------------------------------------------------
         // 1. Update basic product information
         // --------------------------------------------------
-        await db.execute(`
-            UPDATE products
-            SET
-                name = ?,
-                generic_name = ?,
-                category = ?,
-                manufacturer = ?,
-                nafdac_number = ?,
-                barcode = ?,
-                sku = ?,
-                low_stock_level = ?,
-                track_batches = ?,
-                track_expiry = ?,
-                status = ?
-            WHERE id = ?
-        `, [
-            row.name,
-            row.genericName,
-            row.category,
-            row.manufacturer,
-            row.nafdacNumber,
-            row.barcode,
-            row.sku,
-            row.lowStockLevel,
-            row.trackBatches,
-            row.trackExpiry,
-            row.status,
-            row.id,
-        ]);
+        await updateProductRow(db, product);
 
         // --------------------------------------------------
         // 2. Get existing variants
         // --------------------------------------------------
-        const existingVariants = await db.select<Array<{
-            id: string;
-        }>>(
-            `
-            SELECT id
-            FROM variants
-            WHERE product_id = ?
-            `,
-            [product.id]
-        );
+        const existingVariants = await selectVariantIdsByProductId(db, product.id);
 
         const newVariantIds = new Set(
             (product.variants ?? []).map((variant) => variant.id)
@@ -817,15 +601,7 @@ export const updateProduct = async (product: Product) => {
                 continue;
             }
 
-            const stockRows = await db.select<Array<{ id: string }>>(
-                `
-                SELECT id
-                FROM inventory_stock
-                WHERE variant_id = ?
-                LIMIT 1
-                `,
-                [existingVariant.id]
-            );
+            const stockRows = await getInventoryStockReferencesByVariant(db, existingVariant.id);
 
             if (stockRows.length > 0) {
                 throw new Error(
@@ -833,15 +609,7 @@ export const updateProduct = async (product: Product) => {
                 );
             }
 
-            const deliveryRows = await db.select<Array<{ id: string }>>(
-                `
-                SELECT id
-                FROM delivery_items
-                WHERE variant_id = ?
-                LIMIT 1
-                `,
-                [existingVariant.id]
-            );
+            const deliveryRows = await getDeliveryItemReferencesByVariant(db, existingVariant.id);
 
             if (deliveryRows.length > 0) {
                 throw new Error(
@@ -850,16 +618,10 @@ export const updateProduct = async (product: Product) => {
             }
 
             // Delete its packaging units first
-            await db.execute(`
-                DELETE FROM packaging_units
-                WHERE variant_id = ?
-            `, [existingVariant.id]);
+            await deletePackagingUnitsByVariantId(db, existingVariant.id);
 
             // Then delete the variant
-            await db.execute(`
-                DELETE FROM variants
-                WHERE id = ?
-            `, [existingVariant.id]);
+            await deleteVariantRow(db, existingVariant.id);
         }
 
         // --------------------------------------------------
@@ -867,69 +629,23 @@ export const updateProduct = async (product: Product) => {
         // --------------------------------------------------
         for (const variant of product.variants ?? []) {
 
-            const existingVariant = await db.select<Array<{ id: string }>>(
-                `
-                SELECT id
-                FROM variants
-                WHERE id = ?
-                AND product_id = ?
-                `,
-                [variant.id, product.id]
-            );
+            const existingVariant = await selectVariantIdByIdAndProductId(db, variant.id, product.id);
 
             if (existingVariant.length > 0) {
 
                 // Existing variant -> UPDATE it
-                await db.execute(`
-                    UPDATE variants
-                    SET
-                        strength = ?,
-                        strength_unit = ?,
-                        form = ?
-                    WHERE id = ?
-                    AND product_id = ?
-                `, [
-                    variant.strength ?? "",
-                    variant.strengthUnit ?? "",
-                    variant.form ?? "",
-                    variant.id,
-                    product.id,
-                ]);
+                await updateVariantRow(db, variant, product.id);
 
             } else {
 
                 // New variant -> INSERT it
-                await db.execute(`
-                    INSERT INTO variants(
-                        id,
-                        product_id,
-                        strength,
-                        strength_unit,
-                        form
-                    )
-                    VALUES(?, ?, ?, ?, ?)
-                `, [
-                    variant.id,
-                    product.id,
-                    variant.strength ?? "",
-                    variant.strengthUnit ?? "",
-                    variant.form ?? "",
-                ]);
+                await insertVariantRow(db, variant, product.id);
             }
 
             // --------------------------------------------------
             // 5. Get existing packaging units for this variant
             // --------------------------------------------------
-            const existingUnits = await db.select<Array<{
-                id: string;
-            }>>(
-                `
-                SELECT id
-                FROM packaging_units
-                WHERE variant_id = ?
-                `,
-                [variant.id]
-            );
+            const existingUnits = await selectPackagingUnitIdsByVariantId(db, variant.id);
 
             const newUnitIds = new Set(
                 (variant.packagingUnits ?? []).map((unit) => unit.id)
@@ -945,15 +661,7 @@ export const updateProduct = async (product: Product) => {
                 }
 
                 // Check inventory
-                const stockRows = await db.select<Array<{ id: string }>>(
-                    `
-                    SELECT id
-                    FROM inventory_stock
-                    WHERE packaging_unit_id = ?
-                    LIMIT 1
-                    `,
-                    [existingUnit.id]
-                );
+                const stockRows = await getInventoryStockReferencesByPackagingUnit(db, existingUnit.id);
 
                 if (stockRows.length > 0) {
                     throw new Error(
@@ -962,15 +670,7 @@ export const updateProduct = async (product: Product) => {
                 }
 
                 // Check delivery history
-                const deliveryRows = await db.select<Array<{ id: string }>>(
-                    `
-                    SELECT id
-                    FROM delivery_items
-                    WHERE packaging_unit_id = ?
-                    LIMIT 1
-                    `,
-                    [existingUnit.id]
-                );
+                const deliveryRows = await getDeliveryItemReferencesByPackagingUnit(db, existingUnit.id);
 
                 if (deliveryRows.length > 0) {
                     throw new Error(
@@ -979,15 +679,7 @@ export const updateProduct = async (product: Product) => {
                 }
 
                 // Check whether another packaging unit contains this unit
-                const containsRows = await db.select<Array<{ id: string }>>(
-                    `
-                    SELECT id
-                    FROM packaging_units
-                    WHERE contains_unit_id = ?
-                    LIMIT 1
-                    `,
-                    [existingUnit.id]
-                );
+                const containsRows = await selectPackagingUnitIdsContainingUnit(db, existingUnit.id);
 
                 if (containsRows.length > 0) {
                     throw new Error(
@@ -995,10 +687,7 @@ export const updateProduct = async (product: Product) => {
                     );
                 }
 
-                await db.execute(`
-                    DELETE FROM packaging_units
-                    WHERE id = ?
-                `, [existingUnit.id]);
+                await deletePackagingUnitRow(db, existingUnit.id);
             }
 
             // --------------------------------------------------
@@ -1006,73 +695,66 @@ export const updateProduct = async (product: Product) => {
             // --------------------------------------------------
             for (const unit of variant.packagingUnits ?? []) {
 
-                const existingUnit = await db.select<Array<{ id: string }>>(
-                    `
-                    SELECT id
-                    FROM packaging_units
-                    WHERE id = ?
-                    AND variant_id = ?
-                    `,
-                    [unit.id, variant.id]
-                );
+                const existingUnit = await selectPackagingUnitIdByIdAndVariantId(db, unit.id, variant.id);
 
                 if (existingUnit.length > 0) {
 
                     // Existing packaging unit -> UPDATE
-                    await db.execute(`
-                        UPDATE packaging_units
-                        SET
-                        name = ?,
-                        level = ?,
-                        contains_quantity = ?,
-                        contains_unit_id = ?,
-                        cost_price = ?,
-                        selling_price = ?,
-                        is_default = ?
-                        WHERE id = ?
-                        AND variant_id = ?
-                    `, [
-                        unit.name,
-                        variant.packagingUnits.indexOf(unit) + 1,
-                        unit.contains?.quantity ?? null,
-                        unit.contains?.unitId ?? null,
-                        unit.costPrice ?? null,
-                        unit.sellingPrice ?? null,
-                        unit.isDefault ? 1 : 0,
-                        unit.id,
+                    await updatePackagingUnitRow(
+                        db,
+                        unit,
                         variant.id,
-                    ]);
+                        variant.packagingUnits.indexOf(unit) + 1
+                    );
 
                 } else {
 
                     // New packaging unit -> INSERT
-                    await db.execute(`
-                        INSERT INTO packaging_units(
-                            id,
-                            variant_id,
-                            name,
-                            level,
-                            contains_quantity,
-                            contains_unit_id,
-                            cost_price,
-                            selling_price,
-                            is_default
-                        )
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    `, [
-                        unit.id,
+                    await insertPackagingUnitRow(
+                        db,
+                        unit,
                         variant.id,
-                        unit.name,
-                        variant.packagingUnits.indexOf(unit) + 1,
-                        unit.contains?.quantity ?? null,
-                        unit.contains?.unitId ?? null,
-                        unit.costPrice ?? null,
-                        unit.sellingPrice ?? null,
-                        unit.isDefault ? 1 : 0,
-                    ]);
+                        variant.packagingUnits.indexOf(unit) + 1
+                    );
                 }
             }
         }
+
+        for (const stock of stockEntries) {
+            if (!stock.packagingUnitId) {
+                continue;
+            }
+
+            const normalizedQuantity = Number(stock.quantity);
+            if (!Number.isFinite(normalizedQuantity) || normalizedQuantity < 0) {
+                throw new Error(`Stock quantity for ${stock.packagingUnitId} cannot be negative`);
+            }
+
+            await setInventoryStockEntry(db, product.id, {
+                id: stock.id,
+                packagingUnitId: stock.packagingUnitId,
+                quantity: normalizedQuantity,
+                batchNumber: stock.batchNumber,
+                expiryDate: stock.expiryDate,
+                costPrice: stock.costPrice,
+                sellingPrice: stock.sellingPrice,
+            });
+        }
+
+        const stockAfter = await selectRawInventoryStockRows(db, { productId: product.id });
+        const changes = getProductActivityChanges(existingProduct, product, stockBefore, stockAfter);
+        const isArchiveTransition = existingProduct.status !== "archived" && product.status === "archived";
+        await recordActivity(db, {
+            eventType: isArchiveTransition ? "product.archived" : "product.edited",
+            entityType: "product",
+            entityId: product.id,
+            entityLabel: product.name,
+            summary: isArchiveTransition
+                ? `Product archived: ${product.name}`
+                : `Product edited: ${product.name}`,
+            reason: normalizedReason,
+            changes,
+        });
 
         await db.execute(`COMMIT`);
 
@@ -1087,470 +769,238 @@ export const updateProduct = async (product: Product) => {
     }
 };
 
-export const deleteProduct = async (id: string) => {
-    const db = await Database.load("sqlite:tipia.db");
-
-    return await db.execute(`
-        UPDATE products
-        SET status = 'archived'
-        WHERE id = ?
-    `, [id]);
+const normalizeAdjustmentText = (value: string | null, field: string): string | null => {
+    if (value === null) return null;
+    if (typeof value !== "string") throw new Error(`${field} must be a string or null`);
+    return value.trim() ? value : null;
 };
 
-export const createDelivery = async (delivery: Delivery) => {
-    const db = await Database.load("sqlite:tipia.db");
-    return await db.execute(`
-        INSERT INTO deliveries(
-            id, supplier, invoice_no, date, received_by
-        )
-        VALUES(?, ?, ?, ?, ?)
-    `, [
-        delivery.id,
-        delivery.supplier,
-        delivery.invoiceNo,
-        delivery.date,
-        delivery.receivedBy
-    ]);
-};
-
-export const createDeliveryItem = async (item: DeliveryItems) => {
-    const db = await Database.load("sqlite:tipia.db");
-    return await db.execute(`
-        INSERT INTO delivery_items(
-            id, delivery_id, product_id, variant_id, packaging_unit_id,
-            quantity, batch_number, expiry_date, cost_price, selling_price
-        )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-        item.id,
-        item.deliveryId,
-        item.productId,
-        item.variantId,
-        item.packagingUnitId,
-        item.quantity,
-        item.batchNumber,
-        item.expiryDate,
-        item.costPrice,
-        item.sellingPrice
-    ]);
-};
-
-export const getDeliveries = async (): Promise<Delivery[]> => {
-    const db = await Database.load("sqlite:tipia.db");
-
-    const deliveryRows = await db.select<Array<{
-        id: string;
-        supplier: string;
-        invoiceNo: string;
-        date: string;
-        receivedBy: string;
-        status: "draft" | "approved";
-    }>>(`
-        SELECT 
-            id, supplier, invoice_no AS invoiceNo, date, received_by AS receivedBy, status
-        FROM deliveries
-        ORDER BY date DESC
-    `);
-
-    const itemRows = await db.select<Array<{
-        id: string;
-        deliveryId: string;
-        productId: string;
-        variantId: string;
-        packagingUnitId: string;
-        quantity: number;
-        batchNumber: string | null;
-        expiryDate: string | null;
-        costPrice: number;
-        sellingPrice: number;
-    }>>(`
-        SELECT 
-            id, 
-            delivery_id AS deliveryId, 
-            product_id AS productId, 
-            variant_id AS variantId, 
-            packaging_unit_id AS packagingUnitId, 
-            quantity, 
-            batch_number AS batchNumber, 
-            expiry_date AS expiryDate, 
-            cost_price AS costPrice, 
-            selling_price AS sellingPrice
-        FROM delivery_items
-    `);
-
-    return deliveryRows.map((dRow) => ({
-        ...dRow,
-        items: itemRows
-            .filter((item) => item.deliveryId === dRow.id)
-            .map((item) => ({
-                ...item,
-                batchNumber: item.batchNumber ?? undefined,
-                expiryDate: item.expiryDate ?? undefined,
-            })),
-    }));
-};
-
-export const getDeliveryById = async (id: string): Promise<Delivery | null> => {
-    const db = await Database.load("sqlite:tipia.db");
-
-    const deliveryRows = await db.select<Array<{
-        id: string;
-        supplier: string;
-        invoiceNo: string;
-        date: string;
-        receivedBy: string;
-        status: "draft" | "approved";
-    }>>(`
-        SELECT 
-            id, supplier, invoice_no AS invoiceNo, date, received_by AS receivedBy, status
-        FROM deliveries 
-        WHERE id = ?
-    `, [id]);
-
-    if (deliveryRows.length === 0) return null;
-
-    const dRow = deliveryRows[0];
-
-    const itemRows = await db.select<Array<{
-        id: string;
-        deliveryId: string;
-        productId: string;
-        variantId: string;
-        packagingUnitId: string;
-        quantity: number;
-        batchNumber: string | null;
-        expiryDate: string | null;
-        costPrice: number;
-        sellingPrice: number;
-    }>>(`
-        SELECT 
-            id, 
-            delivery_id AS deliveryId, 
-            product_id AS productId, 
-            variant_id AS variantId, 
-            packaging_unit_id AS packagingUnitId, 
-            quantity, 
-            batch_number AS batchNumber, 
-            expiry_date AS expiryDate, 
-            cost_price AS costPrice, 
-            selling_price AS sellingPrice
-        FROM delivery_items
-        WHERE delivery_id = ?
-    `, [id]);
-
+const normalizeAdjustmentValues = (values: InventoryStockValues, label: string): InventoryStockValues => {
+    if (!values || typeof values !== "object") {
+        throw new Error(`${label} values are required`);
+    }
     return {
-        ...dRow,
-        items: itemRows.map((item) => ({
-            ...item,
-            batchNumber: item.batchNumber ?? undefined,
-            expiryDate: item.expiryDate ?? undefined,
-        })),
+        quantity: values.quantity,
+        batchNumber: normalizeAdjustmentText(values.batchNumber, `${label} batch number`),
+        expiryDate: normalizeAdjustmentText(values.expiryDate, `${label} expiry date`),
+        costPrice: values.costPrice,
+        sellingPrice: values.sellingPrice,
     };
 };
 
-export const updateProductStock = async (
-    productId: string,
-    stockEntries: InventoryStockEntryInput[] = []
-) => {
-    const db = await Database.load("sqlite:tipia.db");
+const validateAdjustmentValues = (values: InventoryStockValues) => {
+    if (!Number.isFinite(values.quantity) || values.quantity < 0 || !Number.isInteger(values.quantity)) {
+        throw new Error("Adjusted quantity must be a non-negative whole number");
+    }
+    if (!Number.isFinite(values.costPrice) || values.costPrice < 0) {
+        throw new Error("Adjusted cost price must be a non-negative number");
+    }
+    if (!Number.isFinite(values.sellingPrice) || values.sellingPrice < 0) {
+        throw new Error("Adjusted selling price must be a non-negative number");
+    }
+    if (values.expiryDate !== null && !isValidExpiryDate(values.expiryDate)) {
+        throw new Error("Adjusted expiry date is invalid");
+    }
+};
+
+const adjustmentValuesMatch = (left: InventoryStockValues, right: InventoryStockValues) =>
+    left.quantity === right.quantity &&
+    left.batchNumber === right.batchNumber &&
+    left.expiryDate === right.expiryDate &&
+    left.costPrice === right.costPrice &&
+    left.sellingPrice === right.sellingPrice;
+
+export const adjustInventory = async (input: InventoryAdjustmentInput) => {
+    const db = await loadDatabase();
 
     try {
         await db.execute(`PRAGMA foreign_keys = ON;`);
         await db.execute(`BEGIN`);
 
-        for (const stock of stockEntries) {
-            if (!stock.packagingUnitId) {
-                continue;
+        if (typeof input.reason !== "string" || !input.reason.trim()) {
+            throw new Error("An inventory adjustment reason is required");
+        }
+        const reason = input.reason.trim();
+        if (typeof input.productId !== "string" || !input.productId.trim()) {
+            throw new Error("A product ID is required for an inventory adjustment");
+        }
+        if (!Array.isArray(input.changes) || input.changes.length === 0) {
+            throw new Error("At least one inventory stock row change is required");
+        }
+
+        const productSnapshot = await getProductActivitySnapshot(db, input.productId);
+        if (!productSnapshot) {
+            throw new Error(`Product ${input.productId} does not exist`);
+        }
+        const stockRows = await selectRawInventoryStockRows(db, { productId: input.productId });
+        const rowsById = new Map(stockRows.map((row) => [row.id, row]));
+        const seenRowIds = new Set<string>();
+        const plannedChanges: Array<{
+            stockRowId: string;
+            variantId: string;
+            packagingUnitId: string;
+            before: InventoryStockValues;
+            after: InventoryStockValues;
+        }> = [];
+
+        for (const change of input.changes) {
+            if (!change || typeof change.stockRowId !== "string" || !change.stockRowId) {
+                throw new Error("An inventory stock row ID is required for every change");
+            }
+            if (seenRowIds.has(change.stockRowId)) {
+                throw new Error(`Inventory stock row ${change.stockRowId} appears more than once`);
+            }
+            seenRowIds.add(change.stockRowId);
+            if (typeof change.variantId !== "string" || !change.variantId ||
+                typeof change.packagingUnitId !== "string" || !change.packagingUnitId) {
+                throw new Error(`Inventory stock row ${change.stockRowId} requires a variant and packaging unit`);
+            }
+            if (!change.after || Object.prototype.hasOwnProperty.call(change.after, "packagingUnitId")) {
+                throw new Error("Inventory adjustments cannot change a stock row packaging unit");
             }
 
-            const variantRows = await db.select<Array<{ variantId: string }>>(
-                `
-                SELECT variant_id AS variantId
-                FROM packaging_units
-                WHERE id = ?
-                LIMIT 1
-                `,
-                [stock.packagingUnitId]
-            );
-
-            if (variantRows.length === 0) {
-                continue;
+            const row = rowsById.get(change.stockRowId);
+            if (!row) {
+                throw new Error(`Inventory stock row ${change.stockRowId} does not exist for product ${input.productId}`);
+            }
+            if (row.variantId !== change.variantId || row.packagingUnitId !== change.packagingUnitId) {
+                throw new Error(`Inventory stock row ${change.stockRowId} does not match the supplied variant and packaging unit`);
+            }
+            const variant = productSnapshot.variants.find((candidate) => candidate.id === row.variantId);
+            if (!variant || variant.productId !== input.productId ||
+                !variant.packagingUnits.some((unit) => unit.id === row.packagingUnitId)) {
+                throw new Error(`Inventory stock row ${change.stockRowId} has an invalid product, variant, or packaging unit relationship`);
             }
 
-            const variantId = variantRows[0].variantId;
-            const normalizedQuantity = Number(stock.quantity);
-            if (!Number.isFinite(normalizedQuantity) || normalizedQuantity < 0) {
-                throw new Error(`Stock quantity for ${stock.packagingUnitId} cannot be negative`);
+            const before = normalizeAdjustmentValues({
+                quantity: row.quantity,
+                batchNumber: row.batchNumber,
+                expiryDate: row.expiryDate,
+                costPrice: row.costPrice,
+                sellingPrice: row.sellingPrice,
+            }, "Current");
+            const expectedBefore = normalizeAdjustmentValues(change.expectedBefore, "Expected before");
+            if (!adjustmentValuesMatch(before, expectedBefore)) {
+                throw new Error(`Inventory stock row ${change.stockRowId} has changed; refresh before adjusting it`);
             }
 
-            const identityKey = {
-                productId,
-                variantId,
-                packagingUnitId: stock.packagingUnitId,
-                batchNumber: stock.batchNumber ?? null,
-                expiryDate: stock.expiryDate ?? null,
-            };
-
-            const rowsById = stock.id
-                ? await db.select<Array<{ id: string }>>(
-                    `SELECT id FROM inventory_stock WHERE id = ? LIMIT 1`,
-                    [stock.id]
-                )
-                : [];
-            const existingRows = rowsById.length > 0
-                ? rowsById
-                : await db.select<Array<{ id: string }>>(
-                    `
-                    SELECT id
-                    FROM inventory_stock
-                    WHERE product_id = ?
-                      AND variant_id = ?
-                      AND packaging_unit_id = ?
-                      AND COALESCE(batch_number, '') = COALESCE(?, '')
-                      AND COALESCE(expiry_date, '') = COALESCE(?, '')
-                    `,
-                    [
-                        identityKey.productId,
-                        identityKey.variantId,
-                        identityKey.packagingUnitId,
-                        identityKey.batchNumber,
-                        identityKey.expiryDate,
-                    ]
-                );
-
-            if (existingRows.length === 0) {
-                if (normalizedQuantity === 0) {
-                    continue;
-                }
-
-                await db.execute(
-                    `
-                    INSERT INTO inventory_stock(
-                        id,
-                        product_id,
-                        variant_id,
-                        packaging_unit_id,
-                        quantity,
-                        batch_number,
-                        expiry_date,
-                        cost_price,
-                        selling_price
-                    )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    `,
-                    [
-                        stock.id ?? crypto.randomUUID(),
-                        productId,
-                        variantId,
-                        stock.packagingUnitId,
-                        normalizedQuantity,
-                        stock.batchNumber ?? null,
-                        stock.expiryDate ?? null,
-                        stock.costPrice,
-                        stock.sellingPrice,
-                    ]
-                );
-
-                continue;
+            const after = normalizeAdjustmentValues(change.after, "After");
+            validateAdjustmentValues(after);
+            if (adjustmentValuesMatch(before, after)) {
+                throw new Error(`Inventory stock row ${change.stockRowId} has no changes to apply`);
             }
 
-            if (normalizedQuantity === 0) {
-                await db.execute(`DELETE FROM inventory_stock WHERE id = ?`, [existingRows[0].id]);
-                continue;
-            }
+            plannedChanges.push({
+                stockRowId: row.id,
+                variantId: row.variantId,
+                packagingUnitId: row.packagingUnitId,
+                before,
+                after,
+            });
+        }
 
-            await db.execute(
-                `
-                UPDATE inventory_stock
-                SET
-                    variant_id = ?,
-                    packaging_unit_id = ?,
-                    quantity = ?,
-                    batch_number = ?,
-                    expiry_date = ?,
-                    cost_price = ?,
-                    selling_price = ?
-                WHERE id = ?
-                `,
-                [
-                    variantId,
-                    stock.packagingUnitId,
-                    normalizedQuantity,
-                    stock.batchNumber ?? null,
-                    stock.expiryDate ?? null,
-                    stock.costPrice,
-                    stock.sellingPrice,
-                    existingRows[0].id,
-                ]
-            );
+        for (const change of plannedChanges) {
+            await setInventoryStockEntry(db, input.productId, {
+                id: change.stockRowId,
+                variantId: change.variantId,
+                packagingUnitId: change.packagingUnitId,
+                quantity: change.after.quantity,
+                batchNumber: change.after.batchNumber ?? undefined,
+                expiryDate: change.after.expiryDate ?? undefined,
+                costPrice: change.after.costPrice,
+                sellingPrice: change.after.sellingPrice,
+            }, { mode: "existing" });
+        }
+
+        await recordActivity(db, {
+            eventType: "inventory.adjusted",
+            entityType: "product",
+            entityId: input.productId,
+            entityLabel: productSnapshot.name,
+            summary: `Inventory adjusted: ${productSnapshot.name}`,
+            reason,
+            changes: null,
+            details: { rows: plannedChanges },
+        });
+
+        await db.execute(`COMMIT`);
+        return { success: true, productId: input.productId };
+    } catch (error) {
+        try {
+            await db.execute(`ROLLBACK`);
+        } catch {
+            // Preserve the failure that caused the transaction to roll back.
+        }
+        throw error;
+    }
+};
+
+export const deleteProduct = async (id: string) => {
+    const db = await loadDatabase();
+
+    try {
+        await db.execute(`PRAGMA foreign_keys = ON;`);
+        await db.execute(`BEGIN`);
+
+        const existingProduct = await getProductActivitySnapshot(db, id);
+        const result = await archiveProductRow(db, id);
+
+        if (existingProduct && existingProduct.status !== "archived") {
+            const archivedProduct = { ...existingProduct, status: "archived" as const };
+            await recordActivity(db, {
+                eventType: "product.archived",
+                entityType: "product",
+                entityId: id,
+                entityLabel: existingProduct.name,
+                summary: `Product archived: ${existingProduct.name}`,
+                reason: null,
+                changes: getProductActivityChanges(existingProduct, archivedProduct),
+            });
         }
 
         await db.execute(`COMMIT`);
-
-        return { success: true };
+        return result;
     } catch (error) {
         await db.execute(`ROLLBACK`);
         throw error;
     }
 };
 
-export const addStock = async (
-    db: SqliteDatabase,
-    item: DeliveryItems
-) => {
-    if (!Number.isFinite(item.quantity) || item.quantity < 0 || !Number.isInteger(item.quantity)) {
-        throw new Error("Stock quantity must be a non-negative whole number");
-    }
+export const createDelivery = async (delivery: Delivery) => {
+    return await createDeliveryRow(delivery);
+};
 
-    const existingRows = await db.select<Array<{
-        id: string;
-        quantity: number;
-    }>>(
-        `
-        SELECT id, quantity
-        FROM inventory_stock
-        WHERE product_id = ?
-          AND variant_id = ?
-          AND packaging_unit_id = ?
-          AND COALESCE(batch_number, '') = COALESCE(?, '')
-          AND COALESCE(expiry_date, '') = COALESCE(?, '')
-        `,
-        [
-            item.productId,
-            item.variantId,
-            item.packagingUnitId,
-            item.batchNumber ?? null,
-            item.expiryDate ?? null,
-        ]
-    );
+export const createDeliveryItem = async (item: DeliveryItems) => {
+    return await createDeliveryItemRow(item);
+};
 
-    if (existingRows.length > 0) {
-        const nextQuantity = existingRows[0].quantity + item.quantity;
-        if (nextQuantity < 0) {
-            throw new Error("Cannot add negative stock to an inventory batch");
-        }
+export const getDeliveries = async (): Promise<Delivery[]> => {
+    return await getDeliveryRows();
+};
 
-        await db.execute(
-            `
-            UPDATE inventory_stock
-            SET quantity = quantity + ?
-            WHERE id = ?
-            `,
-            [
-                item.quantity,
-                existingRows[0].id,
-            ]
-        );
-
-        return;
-    }
-
-    if (item.quantity === 0) {
-        return;
-    }
-
-    await db.execute(
-        `
-        INSERT INTO inventory_stock(
-            id,
-            product_id,
-            variant_id,
-            packaging_unit_id,
-            quantity,
-            batch_number,
-            expiry_date,
-            cost_price,
-            selling_price
-        )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `,
-        [
-            crypto.randomUUID(),
-            item.productId,
-            item.variantId,
-            item.packagingUnitId,
-            item.quantity,
-            item.batchNumber ?? null,
-            item.expiryDate ?? null,
-            item.costPrice,
-            item.sellingPrice,
-        ]
-    );
+export const getDeliveryById = async (id: string): Promise<Delivery | null> => {
+    return await getDeliveryRowById(id);
 };
 
 export const saveDeliveryDraft = async (delivery: Delivery) => {
-    const db = await Database.load("sqlite:tipia.db");
+    const db = await loadDatabase();
 
     try {
         await db.execute(`PRAGMA foreign_keys = ON;`);
         await db.execute(`BEGIN`);
 
-        const existingDelivery = await db.select<Array<{ id: string }>>(
-            `SELECT id FROM deliveries WHERE id = ?`,
-            [delivery.id]
-        );
+        const existingDelivery = await selectDeliveryIdsById(db, delivery.id);
 
         if (existingDelivery.length > 0) {
-            await db.execute(`
-                UPDATE deliveries
-                SET supplier = ?, invoice_no = ?, date = ?, received_by = ?, status = 'draft'
-                WHERE id = ?
-            `, [
-                delivery.supplier,
-                delivery.invoiceNo,
-                delivery.date,
-                delivery.receivedBy,
-                delivery.id,
-            ]);
+            await updateDeliveryRow(db, delivery, "draft");
         } else {
-            await db.execute(`
-                INSERT INTO deliveries(
-                    id,
-                    supplier,
-                    invoice_no,
-                    date,
-                    received_by,
-                    status
-                )
-                VALUES(?, ?, ?, ?, ?, 'draft')
-            `, [
-                delivery.id,
-                delivery.supplier,
-                delivery.invoiceNo,
-                delivery.date,
-                delivery.receivedBy,
-            ]);
+            await insertDeliveryRowWithStatus(db, delivery, "draft");
         }
 
-        await db.execute(`DELETE FROM delivery_items WHERE delivery_id = ?`, [delivery.id]);
+        await deleteDeliveryItemsByDeliveryId(db, delivery.id);
 
         for (const item of delivery.items) {
-            await db.execute(`
-                INSERT INTO delivery_items(
-                    id,
-                    delivery_id,
-                    product_id,
-                    variant_id,
-                    packaging_unit_id,
-                    quantity,
-                    batch_number,
-                    expiry_date,
-                    cost_price,
-                    selling_price
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, [
-                item.id,
-                item.deliveryId,
-                item.productId,
-                item.variantId,
-                item.packagingUnitId,
-                item.quantity,
-                item.batchNumber ?? null,
-                item.expiryDate ?? null,
-                item.costPrice,
-                item.sellingPrice,
-            ]);
+            await insertDeliveryItemRow(db, item);
         }
 
         await db.execute(`COMMIT`);
@@ -1562,7 +1012,7 @@ export const saveDeliveryDraft = async (delivery: Delivery) => {
 };
 
 export const receiveDelivery = async (delivery: Delivery) => {
-    const db = await Database.load("sqlite:tipia.db");
+    const db = await loadDatabase();
 
     try {
         await db.execute(`PRAGMA foreign_keys = ON;`);
@@ -1573,74 +1023,59 @@ export const receiveDelivery = async (delivery: Delivery) => {
             throw new Error("Draft delivery must be saved using saveDeliveryDraft without creating stock.");
         }
 
-        const existingDelivery = await db.select<Array<{ id: string }>>(
-            `SELECT id FROM deliveries WHERE id = ?`,
-            [delivery.id]
-        );
+        const existingDelivery = await selectDeliveryIdsById(db, delivery.id);
 
         if (existingDelivery.length > 0) {
-            await db.execute(`
-                UPDATE deliveries 
-                SET supplier = ?, invoice_no = ?, date = ?, received_by = ?, status = 'approved'
-                WHERE id = ?
-            `, [
-                delivery.supplier,
-                delivery.invoiceNo,
-                delivery.date,
-                delivery.receivedBy,
-                delivery.id,
-            ]);
-            await db.execute(`DELETE FROM delivery_items WHERE delivery_id = ?`, [delivery.id]);
+            await updateDeliveryRow(db, delivery, "approved");
+            await deleteDeliveryItemsByDeliveryId(db, delivery.id);
         } else {
-            await db.execute(`
-                INSERT INTO deliveries(
-                    id,
-                    supplier,
-                    invoice_no,
-                    date,
-                    received_by,
-                    status
-                )
-                VALUES(?, ?, ?, ?, ?, 'approved')
-            `, [
-                delivery.id,
-                delivery.supplier,
-                delivery.invoiceNo,
-                delivery.date,
-                delivery.receivedBy,
-            ]);
+            await insertDeliveryRowWithStatus(db, delivery, "approved");
         }
 
         for (const item of delivery.items) {
-            await db.execute(`
-                INSERT INTO delivery_items(
-                    id,
-                    delivery_id,
-                    product_id,
-                    variant_id,
-                    packaging_unit_id,
-                    quantity,
-                    batch_number,
-                    expiry_date,
-                    cost_price,
-                    selling_price
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, [
-                item.id,
-                item.deliveryId,
-                item.productId,
-                item.variantId,
-                item.packagingUnitId,
-                item.quantity,
-                item.batchNumber ?? null,
-                item.expiryDate ?? null,
-                item.costPrice,
-                item.sellingPrice,
-            ]);
-
-            await addStock(db, item);
+            await insertDeliveryItemRow(db, item);
+            await addInventoryStock(db, item);
         }
+
+        const deliveryProducts = new Map<string, Product | null>();
+        for (const item of delivery.items) {
+            if (!deliveryProducts.has(item.productId)) {
+                deliveryProducts.set(item.productId, await getProductActivitySnapshot(db, item.productId));
+            }
+        }
+
+        await recordActivity(db, {
+            eventType: "delivery.received",
+            entityType: "delivery",
+            entityId: delivery.id,
+            entityLabel: `Invoice ${delivery.invoiceNo}`,
+            summary: `Delivery from ${delivery.supplier} received on ${delivery.date} by ${delivery.receivedBy} (${delivery.items.length} item${delivery.items.length === 1 ? "" : "s"})`,
+            reason: null,
+            details: {
+                supplier: delivery.supplier,
+                invoiceNo: delivery.invoiceNo,
+                deliveryDate: delivery.date,
+                receivedBy: delivery.receivedBy,
+                items: delivery.items.map((item) => {
+                    const productSnapshot = deliveryProducts.get(item.productId) ?? null;
+                    const variant = productSnapshot?.variants.find((entry) => entry.id === item.variantId);
+                    const packagingUnit = variant?.packagingUnits.find((unit) => unit.id === item.packagingUnitId);
+                    return {
+                        productId: item.productId,
+                        productName: productSnapshot?.name ?? null,
+                        variantId: item.variantId,
+                        variantLabel: getActivityVariantLabel(variant),
+                        packagingUnitId: item.packagingUnitId,
+                        packagingUnitName: packagingUnit?.name ?? null,
+                        quantity: item.quantity,
+                        batchNumber: item.batchNumber ?? null,
+                        expiryDate: item.expiryDate ?? null,
+                        costPrice: item.costPrice,
+                        sellingPrice: item.sellingPrice,
+                    };
+                }),
+            },
+        });
 
         await db.execute(`COMMIT`);
 
@@ -1655,54 +1090,7 @@ export const receiveDelivery = async (delivery: Delivery) => {
 };
 
 export const getSmallestPackagingUnit = (variant: Variant): PackagingUnit | null => {
-    return variant.packagingUnits[variant.packagingUnits.length - 1] ?? null;
-};
-
-export const getConversionFactor = (
-    fromUnitId: string,
-    toUnitId: string,
-    packagingUnits: PackagingUnit[]
-): number => {
-    if (fromUnitId === toUnitId) return 1;
-
-    const unitsById = new Map(packagingUnits.map((unit) => [unit.id, unit]));
-    const queue: Array<{ unitId: string; factor: number }> = [{ unitId: fromUnitId, factor: 1 }];
-    const visited = new Set<string>([fromUnitId]);
-
-    while (queue.length > 0) {
-        const current = queue.shift();
-        if (!current) break;
-
-        const currentUnit = unitsById.get(current.unitId);
-        if (!currentUnit) {
-            continue;
-        }
-
-        if (currentUnit.contains) {
-            const nextUnitId = currentUnit.contains.unitId;
-            const nextUnit = unitsById.get(nextUnitId);
-            if (nextUnit) {
-                const nextFactor = current.factor * currentUnit.contains.quantity;
-                if (nextUnitId === toUnitId) return nextFactor;
-                if (!visited.has(nextUnit.id)) {
-                    visited.add(nextUnit.id);
-                    queue.push({ unitId: nextUnit.id, factor: nextFactor });
-                }
-            }
-        }
-
-        const parents = packagingUnits.filter((unit) => unit.contains?.unitId === current.unitId);
-        for (const parent of parents) {
-            const parentFactor = current.factor / (parent.contains?.quantity ?? 1);
-            if (parent.id === toUnitId) return parentFactor;
-            if (!visited.has(parent.id)) {
-                visited.add(parent.id);
-                queue.push({ unitId: parent.id, factor: parentFactor });
-            }
-        }
-    }
-
-    throw new Error(`Cannot convert packaging unit ${fromUnitId} to ${toUnitId}`);
+    return getSmallestPackagingUnitFromHierarchy(variant.packagingUnits);
 };
 
 export const convertQuantityToSmallest = (
@@ -1723,35 +1111,12 @@ export const convertQuantityToSmallest = (
     return getConversionFactor(packagingUnitId, smallestUnit.id, packagingUnits) * quantity;
 };
 
-const getPackagingUnitsForVariant = async (
-    db: SqliteDatabase,
-    variantId: string
-): Promise<PackagingUnit[]> => {
-    const rows = await db.select<Array<PackagingUnitRow>>(`
-        SELECT
-            id,
-            variant_id AS variantId,
-            name,
-            level,
-            contains_quantity AS containsQuantity,
-            contains_unit_id AS containsUnitId,
-            cost_price AS costPrice,
-            selling_price AS sellingPrice,
-            is_default AS isDefault
-        FROM packaging_units
-        WHERE variant_id = ?
-        ORDER BY level ASC
-    `, [variantId]);
-
-    return rows.map(mapRowToPackagingUnit);
-};
-
 export const getAvailableQuantityInUnit = async (
     productId: string,
     variantId: string,
     packagingUnitId: string
 ): Promise<number> => {
-    const db = await Database.load("sqlite:tipia.db");
+    const db = await loadDatabase();
     const packagingUnits = await getPackagingUnitsForVariant(db, variantId);
     if (packagingUnits.length === 0) {
         return 0;
@@ -1762,14 +1127,7 @@ export const getAvailableQuantityInUnit = async (
         throw new Error(`Packaging unit ${packagingUnitId} does not belong to variant ${variantId}`);
     }
 
-    const stockRows = await db.select<Array<{
-        packagingUnitId: string;
-        quantity: number;
-    }>>(`
-        SELECT packaging_unit_id AS packagingUnitId, quantity
-        FROM inventory_stock
-        WHERE product_id = ? AND variant_id = ?
-    `, [productId, variantId]);
+    const stockRows = await getInventoryStockQuantitiesByVariant(db, productId, variantId);
 
     return stockRows.reduce((total, row) => {
         const factor = getConversionFactor(
@@ -1806,6 +1164,7 @@ export type DashboardQuantity = {
 
 export type DashboardSummary = {
     nearExpiry: DashboardStockLine[];
+    expiresToday: DashboardStockLine[];
     expired: DashboardStockLine[];
     lowStock: DashboardQuantity[];
     outOfStock: DashboardQuantity[];
@@ -1817,30 +1176,23 @@ const formatVariantLabel = (variant: Variant) =>
         .join(" ");
 
 export const getDashboardSummary = async (): Promise<DashboardSummary> => {
-    const db = await Database.load("sqlite:tipia.db");
+    const db = await loadDatabase();
+    const referenceDate = getCurrentCalendarDate();
     const productsFromDb = await getProducts();
     const activeProducts = productsFromDb.filter((product) => product.status !== "archived");
-    const stockRows = await db.select<Array<{
-        id: string;
-        productId: string;
-        variantId: string;
-        packagingUnitId: string;
-        quantity: number;
-        batchNumber: string | null;
-        expiryDate: string | null;
-    }>>(`
-        SELECT
-            id,
-            product_id AS productId,
-            variant_id AS variantId,
-            packaging_unit_id AS packagingUnitId,
-            quantity,
-            batch_number AS batchNumber,
-            expiry_date AS expiryDate
-        FROM inventory_stock
-        WHERE quantity > 0
-        ORDER BY expiry_date ASC, id ASC
-    `);
+    const stockRows = (await selectRawInventoryStockRows(db))
+        .filter((row) => row.quantity > 0)
+        .sort((left, right) => {
+            if (left.expiryDate === null && right.expiryDate !== null) return -1;
+            if (left.expiryDate !== null && right.expiryDate === null) return 1;
+            if (left.expiryDate !== null && right.expiryDate !== null) {
+                if (left.expiryDate < right.expiryDate) return -1;
+                if (left.expiryDate > right.expiryDate) return 1;
+            }
+            if (left.id < right.id) return -1;
+            if (left.id > right.id) return 1;
+            return 0;
+        });
 
     const stockLines: DashboardStockLine[] = [];
     const quantities: DashboardQuantity[] = [];
@@ -1897,15 +1249,18 @@ export const getDashboardSummary = async (): Promise<DashboardSummary> => {
     }
 
     const nearExpiry: DashboardStockLine[] = [];
+    const expiresToday: DashboardStockLine[] = [];
     const expired: DashboardStockLine[] = [];
     for (const line of stockLines) {
-        const days = getDaysUntilExpiry(line.expiryDate as string);
-        if (days <= 0) expired.push(line);
-        else if (days <= 90) nearExpiry.push(line);
+        const classification = classifyExpiry(line.expiryDate, referenceDate);
+        if (classification.state === "expired") expired.push(line);
+        else if (classification.state === "expiresToday") expiresToday.push(line);
+        else if (classification.state === "expiringSoon") nearExpiry.push(line);
     }
 
     return {
         nearExpiry,
+        expiresToday,
         expired,
         lowStock: quantities.filter((entry) => entry.quantity > 0 && entry.quantity <= entry.threshold),
         outOfStock: quantities.filter((entry) => entry.quantity === 0),
@@ -2013,29 +1368,26 @@ const getSaleStockAllocation = (
     return { requestedUnit, allocations };
 };
 
+const applySaleStockAllocation = (
+    db: SqliteDatabase,
+    allocations: Array<{ row: StockRowForSale; sourceQuantity: number }>
+) => applyInventoryStockAllocation(db, allocations.map(({ row, sourceQuantity }) => ({
+    stockRowId: row.id,
+    availableQuantity: row.quantity,
+    quantityToDeduct: sourceQuantity,
+    batchNumber: row.batchNumber,
+})));
+
 export const getSaleStockAllocationPreview = async (
     productId: string,
     variantId: string,
     packagingUnitId: string,
     quantity: number
 ): Promise<SaleStockAllocation[]> => {
-    const db = await Database.load("sqlite:tipia.db");
+    const db = await loadDatabase();
     const [packagingUnits, stockRows] = await Promise.all([
         getPackagingUnitsForVariant(db, variantId),
-        db.select<StockRowForSale[]>(`
-            SELECT
-                id,
-                product_id AS productId,
-                variant_id AS variantId,
-                packaging_unit_id AS packagingUnitId,
-                quantity,
-                batch_number AS batchNumber,
-                expiry_date AS expiryDate,
-                cost_price AS costPrice,
-                selling_price AS sellingPrice
-            FROM inventory_stock
-            WHERE product_id = ? AND variant_id = ? AND quantity > 0
-        `, [productId, variantId]),
+        selectInventoryStockRowsByVariant(db, productId, variantId),
     ]);
 
     if (packagingUnits.length === 0) {
@@ -2051,17 +1403,18 @@ export const getSaleStockAllocationPreview = async (
         batchNumber: row.batchNumber,
         expiryDate: row.expiryDate,
         quantity: allocatedQuantity,
+
     }));
 };
 
 export const deleteSaleDraft = async (saleId: string) => {
-    const db = await Database.load("sqlite:tipia.db");
+    const db = await loadDatabase();
 
     try {
         await db.execute(`PRAGMA foreign_keys = ON;`);
         await db.execute(`BEGIN`);
-        await db.execute(`DELETE FROM sale_items WHERE sale_id = ?`, [saleId]);
-        await db.execute(`DELETE FROM sales WHERE id = ? AND status = 'draft'`, [saleId]);
+        await deleteSaleItemsBySaleId(db, saleId);
+        await deleteSaleDraftById(db, saleId);
         await db.execute(`COMMIT`);
         return { success: true };
     } catch (error) {
@@ -2079,38 +1432,9 @@ export const deductStockForSaleItem = async (
         throw new Error("This product has no packaging units configured for sale");
     }
 
-    const stockRows = await db.select<StockRowForSale[]>(`
-        SELECT
-            id,
-            product_id AS productId,
-            variant_id AS variantId,
-            packaging_unit_id AS packagingUnitId,
-            quantity,
-            batch_number AS batchNumber,
-            expiry_date AS expiryDate,
-            cost_price AS costPrice,
-            selling_price AS sellingPrice
-        FROM inventory_stock
-        WHERE product_id = ? AND variant_id = ? AND quantity > 0
-    `, [item.productId, item.variantId]);
+    const stockRows = await selectInventoryStockRowsByVariant(db, item.productId, item.variantId);
     const { allocations } = getSaleStockAllocation(item, stockRows, packagingUnits);
-
-    for (const allocation of allocations) {
-        const { row, sourceQuantity } = allocation;
-        const sourceAfterSale = row.quantity - sourceQuantity;
-        if (sourceAfterSale < 0) {
-            throw new Error(`Negative stock detected for batch ${row.batchNumber ?? "unknown"}`);
-        }
-
-        if (sourceAfterSale === 0) {
-            await db.execute(`DELETE FROM inventory_stock WHERE id = ?`, [row.id]);
-        } else {
-            await db.execute(
-                `UPDATE inventory_stock SET quantity = ? WHERE id = ?`,
-                [sourceAfterSale, row.id]
-            );
-        }
-    }
+    await applySaleStockAllocation(db, allocations);
 
     return allocations.map(({ row, quantity }) => ({
         batchNumber: row.batchNumber,
@@ -2120,7 +1444,7 @@ export const deductStockForSaleItem = async (
 };
 
 export const saveSaleDraft = async (sale: Sale) => {
-    const db = await Database.load("sqlite:tipia.db");
+    const db = await loadDatabase();
 
     try {
         await db.execute(`PRAGMA foreign_keys = ON;`);
@@ -2130,66 +1454,26 @@ export const saveSaleDraft = async (sale: Sale) => {
             throw new Error("Sale draft must contain at least one item");
         }
 
-        const existingSale = await db.select<Array<{ id: string; status: string }>>(
-            `SELECT id, status FROM sales WHERE id = ?`,
-            [sale.id]
-        );
+        const existingSale = await selectSaleIdsByIdAndStatus(db, sale.id);
 
         if (existingSale.length > 0 && existingSale[0].status !== "draft") {
             throw new Error("Completed sales cannot be saved as drafts");
         }
 
         if (existingSale.length > 0) {
-            await db.execute(`
-                UPDATE sales
-                SET date = ?, sold_by = ?, total_amount = ?, discount = ?, notes = ?, status = 'draft'
-                WHERE id = ?
-            `, [
-                sale.date,
-                sale.soldBy ?? null,
-                sale.totalAmount,
-                sale.discount ?? 0,
-                sale.notes ?? null,
-                sale.id,
-            ]);
+            await updateSaleRow(db, sale, "draft");
         } else {
-            await db.execute(`
-                INSERT INTO sales(id, date, sold_by, total_amount, discount, notes, status)
-                VALUES(?, ?, ?, ?, ?, ?, 'draft')
-            `, [
-                sale.id,
-                sale.date,
-                sale.soldBy ?? null,
-                sale.totalAmount,
-                sale.discount ?? 0,
-                sale.notes ?? null,
-            ]);
+            await insertSaleRow(db, sale, "draft");
         }
 
-        await db.execute(`DELETE FROM sale_items WHERE sale_id = ?`, [sale.id]);
+        await deleteSaleItemsBySaleId(db, sale.id);
 
         for (const item of sale.items) {
             if (!Number.isFinite(item.quantity) || item.quantity <= 0 || !Number.isInteger(item.quantity)) {
                 throw new Error("Draft sale quantity must be a positive whole number");
             }
 
-            await db.execute(`
-                INSERT INTO sale_items(
-                    id, sale_id, product_id, variant_id, packaging_unit_id,
-                    quantity, unit_price, batch_number, expiry_date
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, [
-                item.id,
-                sale.id,
-                item.productId,
-                item.variantId,
-                item.packagingUnitId,
-                item.quantity,
-                item.unitPrice,
-                item.batchNumber ?? null,
-                item.expiryDate ?? null,
-            ]);
+            await insertSaleItemRow(db, sale.id, item);
         }
 
         await db.execute(`COMMIT`);
@@ -2201,7 +1485,7 @@ export const saveSaleDraft = async (sale: Sale) => {
 };
 
 export const createSale = async (sale: Sale) => {
-    const db = await Database.load("sqlite:tipia.db");
+    const db = await loadDatabase();
 
     try {
         await db.execute(`PRAGMA foreign_keys = ON;`);
@@ -2216,131 +1500,102 @@ export const createSale = async (sale: Sale) => {
                 throw new Error("Sale quantity must be a positive whole number");
             }
 
-            const productRow = await db.select<Array<{ id: string }>>(
-                `SELECT id FROM products WHERE id = ? AND status != 'archived'`,
-                [item.productId]
-            );
+            const productRow = await selectNonArchivedProductIdsById(db, item.productId);
             if (productRow.length === 0) {
                 throw new Error(`Product ${item.productId} does not exist or is archived`);
             }
 
-            const variantRow = await db.select<Array<{ id: string }>>(
-                `SELECT id FROM variants WHERE id = ? AND product_id = ?`,
-                [item.variantId, item.productId]
-            );
+            const variantRow = await selectVariantIdByIdAndProductId(db, item.variantId, item.productId);
             if (variantRow.length === 0) {
                 throw new Error(`Variant ${item.variantId} does not belong to product ${item.productId}`);
             }
 
-            const packagingUnitRow = await db.select<Array<{ id: string }>>(
-                `SELECT id FROM packaging_units WHERE id = ? AND variant_id = ?`,
-                [item.packagingUnitId, item.variantId]
+            const packagingUnitRow = await selectPackagingUnitIdByIdAndVariantId(
+                db,
+                item.packagingUnitId,
+                item.variantId
             );
             if (packagingUnitRow.length === 0) {
                 throw new Error(`Packaging unit ${item.packagingUnitId} does not belong to variant ${item.variantId}`);
             }
 
             const packagingUnits = await getPackagingUnitsForVariant(db, item.variantId);
-            const stockRows = await db.select<StockRowForSale[]>(`
-                SELECT
-                    id,
-                    product_id AS productId,
-                    variant_id AS variantId,
-                    packaging_unit_id AS packagingUnitId,
-                    quantity,
-                    batch_number AS batchNumber,
-                    expiry_date AS expiryDate,
-                    cost_price AS costPrice,
-                    selling_price AS sellingPrice
-                FROM inventory_stock
-                WHERE product_id = ? AND variant_id = ? AND quantity > 0
-            `, [item.productId, item.variantId]);
+            const stockRows = await selectInventoryStockRowsByVariant(db, item.productId, item.variantId);
             getSaleStockAllocation(item, stockRows, packagingUnits);
         }
 
-        const existingSale = await db.select<Array<{ id: string }>>(`SELECT id FROM sales WHERE id = ?`, [sale.id]);
+        const existingSale = await selectSaleIdsById(db, sale.id);
         if (existingSale.length > 0) {
-            await db.execute(`
-                UPDATE sales
-                SET date = ?, sold_by = ?, total_amount = ?, discount = ?, notes = ?, status = 'completed'
-                WHERE id = ?
-            `, [
-                sale.date,
-                sale.soldBy ?? null,
-                sale.totalAmount,
-                sale.discount ?? 0,
-                sale.notes ?? null,
-                sale.id,
-            ]);
+            await updateSaleRow(db, sale, "completed");
         } else {
-            await db.execute(`
-                INSERT INTO sales(id, date, sold_by, total_amount, discount, notes, status)
-                VALUES(?, ?, ?, ?, ?, ?, 'completed')
-            `, [
-                sale.id,
-                sale.date,
-                sale.soldBy ?? null,
-                sale.totalAmount,
-                sale.discount ?? 0,
-                sale.notes ?? null,
-            ]);
+            await insertSaleRow(db, sale, "completed");
         }
 
-        await db.execute(`DELETE FROM sale_items WHERE sale_id = ?`, [sale.id]);
+        await deleteSaleItemsBySaleId(db, sale.id);
+
+        const allocatedSaleItems: Array<{
+            item: SaleItem;
+            allocations: Array<{ quantity: number; batchNumber: string | null; expiryDate: string | null }>;
+        }> = [];
 
         for (const item of sale.items) {
             const packagingUnits = await getPackagingUnitsForVariant(db, item.variantId);
-            const stockRows = await db.select<StockRowForSale[]>(`
-                SELECT
-                    id,
-                    product_id AS productId,
-                    variant_id AS variantId,
-                    packaging_unit_id AS packagingUnitId,
-                    quantity,
-                    batch_number AS batchNumber,
-                    expiry_date AS expiryDate,
-                    cost_price AS costPrice,
-                    selling_price AS sellingPrice
-                FROM inventory_stock
-                WHERE product_id = ? AND variant_id = ? AND quantity > 0
-            `, [item.productId, item.variantId]);
+            const stockRows = await selectInventoryStockRowsByVariant(db, item.productId, item.variantId);
             const { allocations } = getSaleStockAllocation(item, stockRows, packagingUnits);
+            const activityAllocations: Array<{ quantity: number; batchNumber: string | null; expiryDate: string | null }> = [];
 
-            for (const allocation of allocations) {
-                const { row, quantity, sourceQuantity } = allocation;
-                const sourceAfterSale = row.quantity - sourceQuantity;
-                if (sourceAfterSale < 0) {
-                    throw new Error(`Negative stock detected for batch ${row.batchNumber ?? "unknown"}`);
-                }
-
-                if (sourceAfterSale === 0) {
-                    await db.execute(`DELETE FROM inventory_stock WHERE id = ?`, [row.id]);
-                } else {
-                    await db.execute(
-                        `UPDATE inventory_stock SET quantity = ? WHERE id = ?`,
-                        [sourceAfterSale, row.id]
-                    );
-                }
-
-                await db.execute(`
-                INSERT INTO sale_items(
-                    id, sale_id, product_id, variant_id, packaging_unit_id,
-                    quantity, unit_price, batch_number, expiry_date
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, [
-                    crypto.randomUUID(),
-                    sale.id,
-                    item.productId,
-                    item.variantId,
-                    item.packagingUnitId,
+            await applySaleStockAllocation(db, allocations);
+            for (const { row, quantity } of allocations) {
+                await insertSaleItemRowWithAllocation(db, sale.id, item, quantity, row.batchNumber ?? null, row.expiryDate ?? null);
+                activityAllocations.push({
                     quantity,
-                    item.unitPrice,
-                    row.batchNumber,
-                    row.expiryDate,
-                ]);
+                    batchNumber: row.batchNumber ?? null,
+                    expiryDate: row.expiryDate ?? null,
+                });
+            }
+            allocatedSaleItems.push({ item, allocations: activityAllocations });
+        }
+
+        const itemCount = sale.items.length;
+        const sellerSummary = sale.soldBy?.trim() ? `, sold by ${sale.soldBy.trim()}` : "";
+        const saleProducts = new Map<string, Product | null>();
+        for (const item of sale.items) {
+            if (!saleProducts.has(item.productId)) {
+                saleProducts.set(item.productId, await getProductActivitySnapshot(db, item.productId));
             }
         }
+        await recordActivity(db, {
+            eventType: "sale.completed",
+            entityType: "sale",
+            entityId: sale.id,
+            entityLabel: `Sale ${sale.date}`,
+            summary: `Completed sale: ${itemCount} item${itemCount === 1 ? "" : "s"}, total ₦${sale.totalAmount.toFixed(2)}${sellerSummary}`,
+            reason: null,
+            details: {
+                saleDate: sale.date,
+                soldBy: sale.soldBy ?? null,
+                notes: sale.notes ?? null,
+                totalAmount: sale.totalAmount,
+                discount: sale.discount ?? 0,
+                items: allocatedSaleItems.map(({ item, allocations }) => {
+                    const productSnapshot = saleProducts.get(item.productId) ?? null;
+                    const variant = productSnapshot?.variants.find((entry) => entry.id === item.variantId);
+                    const packagingUnit = variant?.packagingUnits.find((unit) => unit.id === item.packagingUnitId);
+                    return {
+                        productId: item.productId,
+                        productName: productSnapshot?.name ?? null,
+                        variantId: item.variantId,
+                        variantLabel: getActivityVariantLabel(variant),
+                        packagingUnitId: item.packagingUnitId,
+                        packagingUnitName: packagingUnit?.name ?? null,
+                        quantity: item.quantity,
+                        unitPrice: item.unitPrice,
+                        lineAmount: calculateSaleLineAmount(item.quantity, item.unitPrice),
+                        allocations,
+                    };
+                }),
+            },
+        });
 
         await db.execute(`COMMIT`);
         return { success: true, saleId: sale.id };
@@ -2350,103 +1605,11 @@ export const createSale = async (sale: Sale) => {
     }
 };
 
-type SaleRow = {
-    id: string;
-    date: string;
-    soldBy: string | null;
-    totalAmount: number;
-    discount: number | null;
-    notes: string | null;
-    status?: "draft" | "completed";
-};
-
-type SaleItemRow = Omit<SaleItem, "batchNumber" | "expiryDate"> & {
-    batchNumber: string | null;
-    expiryDate: string | null;
-};
-
-const mapSaleItems = (items: SaleItemRow[]): SaleItem[] => items.map((item) => ({
-    ...item,
-    batchNumber: item.batchNumber ?? undefined,
-    expiryDate: item.expiryDate ?? undefined,
-}));
-
 export const getSales = async (): Promise<Sale[]> => {
-    const db = await Database.load("sqlite:tipia.db");
-    const saleRows = await db.select<SaleRow[]>(`
-        SELECT
-            id,
-            date,
-            sold_by AS soldBy,
-            total_amount AS totalAmount,
-            discount,
-            notes,
-            status
-        FROM sales
-        ORDER BY date DESC
-    `);
-    const itemRows = await db.select<SaleItemRow[]>(`
-        SELECT
-            id,
-            sale_id AS saleId,
-            product_id AS productId,
-            variant_id AS variantId,
-            packaging_unit_id AS packagingUnitId,
-            quantity,
-            unit_price AS unitPrice,
-            batch_number AS batchNumber,
-            expiry_date AS expiryDate
-        FROM sale_items
-    `);
-
-    return saleRows.map((saleRow) => ({
-        ...saleRow,
-        soldBy: saleRow.soldBy ?? undefined,
-        discount: saleRow.discount ?? 0,
-        notes: saleRow.notes ?? undefined,
-        status: (saleRow as SaleRow & { status?: "draft" | "completed" }).status ?? "completed",
-        items: mapSaleItems(itemRows.filter((item) => item.saleId === saleRow.id)),
-    }));
+    return await getSaleRows();
 };
 
 export const getSaleById = async (id: string): Promise<Sale | null> => {
-    const db = await Database.load("sqlite:tipia.db");
-    const saleRows = await db.select<SaleRow[]>(`
-        SELECT
-            id,
-            date,
-            sold_by AS soldBy,
-            total_amount AS totalAmount,
-            discount,
-            notes
-        FROM sales
-        WHERE id = ?
-    `, [id]);
-
-    if (saleRows.length === 0) return null;
-
-    const itemRows = await db.select<SaleItemRow[]>(`
-        SELECT
-            id,
-            sale_id AS saleId,
-            product_id AS productId,
-            variant_id AS variantId,
-            packaging_unit_id AS packagingUnitId,
-            quantity,
-            unit_price AS unitPrice,
-            batch_number AS batchNumber,
-            expiry_date AS expiryDate
-        FROM sale_items
-        WHERE sale_id = ?
-    `, [id]);
-
-    const saleRow = saleRows[0];
-    return {
-        ...saleRow,
-        soldBy: saleRow.soldBy ?? undefined,
-        discount: saleRow.discount ?? 0,
-        notes: saleRow.notes ?? undefined,
-        items: mapSaleItems(itemRows),
-    };
+    return await getSaleRowById(id);
 };
 

@@ -4,6 +4,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import ReceiveDelivery from "./pages/ReceiveDelivery";
 import AppLayout from "./components/AppLayout";
 import SalesPage from "./pages/SalesPage";
+import ActivityPage from "./pages/ActivityPage";
 
 function App() {
     return (
@@ -21,6 +22,7 @@ function App() {
                         path="/sales-page"
                         element={<SalesPage />}
                     />
+                    <Route path="/activity" element={<ActivityPage />} />
                 </Route>
                 
                 

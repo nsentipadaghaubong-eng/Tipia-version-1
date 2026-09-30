@@ -17,6 +17,9 @@ const Sidebar = () => {
         <Link to="/sales-page">
             Sales Page
         </Link>
+        <Link to="/activity">
+            Activity
+        </Link>
        </> 
     );
 };

@@ -2,8 +2,9 @@ import { useState, useEffect } from "react"
 import type { Product } from "../types/Product"
 import ProductRow from "../components/ProductRow"
 import CreateProductForm from "../components/CreateProductForm"
-import { getProducts, createProduct, initializeDatabase, updateProduct, updateProductStock, deleteProduct as deleteProductFromDatabase, getCurrentStockForProduct, getCurrentStockForAllProducts, INVENTORY_CHANGED_EVENT, type CurrentStockEntry } from "../database/database"
+import { getProducts, createProduct, initializeDatabase, updateProduct, deleteProduct as deleteProductFromDatabase, getCurrentStockForProduct, getCurrentStockForAllProducts, INVENTORY_CHANGED_EVENT, type CurrentStockEntry } from "../database/database"
 import { formatExpiryStatus } from "../utils/expiry"
+import { calculateStockBreakdown } from "../domain/stockBreakdown"
 
 interface InitialStockEntry {
     id: string;
@@ -82,11 +83,14 @@ const ProductPage = () => {
         setError("")
     }
 
-    async function handleCreateProductSave(product: Product, initialStock: InitialStockEntry[]) {
+    async function handleCreateProductSave(
+        product: Product,
+        initialStock: InitialStockEntry[],
+        editReason?: string
+    ) {
         try {
             if (editingProduct) {
-                await updateProduct(product);
-                await updateProductStock(product.id, initialStock);
+                await updateProduct(product, editReason ?? "", initialStock);
                 setProducts((current) =>
                     current.map((currentProduct) =>
                         currentProduct.id === editingProduct.id ? product : currentProduct
@@ -307,16 +311,30 @@ const ProductPage = () => {
             )}
 
             {filteredProducts.length > 0 ? (
-                filteredProducts.map((product) => (
-                    <ProductRow
-                        key={product.id}
-                        product={product}
-                        stockEntries={productStock[product.id] ?? []}
-                        onView={viewProduct}
-                        onUpdate={editProduct}
-                        onDelete={deleteProduct}
-                    />
-                ))
+                filteredProducts.map((product) => {
+                    const stockEntries = productStock[product.id] ?? [];
+                    const stockBreakdowns = product.variants.map((variant) => ({
+                        variantId: variant.id,
+                        entries: calculateStockBreakdown(
+                            stockEntries
+                                .filter((entry) => entry.variantId === variant.id)
+                                .map(({ packagingUnitId, quantity }) => ({ packagingUnitId, quantity })),
+                            variant.packagingUnits
+                        ),
+                    }));
+
+                    return (
+                        <ProductRow
+                            key={product.id}
+                            product={product}
+                            stockEntries={stockEntries}
+                            stockBreakdowns={stockBreakdowns}
+                            onView={viewProduct}
+                            onUpdate={editProduct}
+                            onDelete={deleteProduct}
+                        />
+                    );
+                })
             ) : (
                 <h2>No item found</h2>
             )}
