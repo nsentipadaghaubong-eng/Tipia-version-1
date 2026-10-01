@@ -85,21 +85,11 @@ const ProductPage = () => {
 
     async function handleCreateProductSave(
         product: Product,
-        initialStock: InitialStockEntry[],
-        editReason?: string
+        initialStock: InitialStockEntry[]
     ) {
         try {
-            if (editingProduct) {
-                await updateProduct(product, editReason ?? "", initialStock);
-                setProducts((current) =>
-                    current.map((currentProduct) =>
-                        currentProduct.id === editingProduct.id ? product : currentProduct
-                    )
-                );
-            } else {
-                await createProduct(product, initialStock);
-                setProducts((current) => [product, ...current]);
-            }
+            await createProduct(product, initialStock);
+            setProducts((current) => [product, ...current]);
 
             const currentStock = await getCurrentStockForProduct(product.id);
             setProductStock((current) => ({
@@ -107,6 +97,23 @@ const ProductPage = () => {
                 [product.id]: currentStock,
             }));
 
+            closeProduct();
+        } catch (saveError) {
+            console.error(saveError);
+            setError(
+                saveError instanceof Error ? saveError.message : "Something went wrong while saving the product"
+            );
+        }
+    }
+
+    async function handleProductEditSave(product: Product, editReason: string) {
+        try {
+            await updateProduct(product, editReason);
+            setProducts((current) =>
+                current.map((currentProduct) =>
+                    currentProduct.id === product.id ? product : currentProduct
+                )
+            );
             closeProduct();
         } catch (saveError) {
             console.error(saveError);
@@ -295,6 +302,8 @@ const ProductPage = () => {
                             existingProducts={products}
                             initialProduct={editingProduct}
                             onSave={handleCreateProductSave}
+                            onEdit={handleProductEditSave}
+                            showStockFields={!editingProduct}
                             onCancel={closeProduct}
                             onUseExistingProduct={(product) => {
                                 void viewProduct(product);

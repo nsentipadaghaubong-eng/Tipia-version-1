@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from "react";
 import type { Product, FormData, Variant, PackagingUnit } from "../types/Product";
-import { getCurrentStockForProduct } from "../database/database";
 import { validatePackagingChain, type PackagingChainValidationError } from "../domain/packagingChainValidation";
 import { formatExpiryStatus } from "../utils/expiry";
 
@@ -17,7 +16,9 @@ interface InitialStockEntry {
 export interface CreateProductFormProps {
     existingProducts: Product[];
     initialProduct?: Product | null;
-    onSave: (product: Product, initialStock: InitialStockEntry[], editReason?: string) => Promise<void> | void;
+    onSave: (product: Product, initialStock: InitialStockEntry[]) => Promise<void> | void;
+    onEdit: (product: Product, editReason: string) => Promise<void> | void;
+    showStockFields?: boolean;
     onCancel: () => void;
     onUseExistingProduct?: (product: Product) => void;
     onModifyExistingProduct?: (product: Product) => void;
@@ -183,6 +184,8 @@ const CreateProductForm = ({
     existingProducts,
     initialProduct,
     onSave,
+    onEdit,
+    showStockFields = true,
     onCancel,
     onUseExistingProduct,
     onModifyExistingProduct,
@@ -198,6 +201,7 @@ const CreateProductForm = ({
     const [dismissedDuplicateKey, setDismissedDuplicateKey] = useState<string | null>(null);
 
     const isEditing = Boolean(initialProduct);
+    const canEditInitialStock = showStockFields && !isEditing;
 
     useEffect(() => {
         if (!initialProduct) {
@@ -230,33 +234,10 @@ const CreateProductForm = ({
         setVariants(nextVariants);
         setIsMultiVariant(initialProduct.variants.length > 1);
         setEditReason("");
-        let cancelled = false;
-
-        const loadCurrentStock = async () => {
-            try {
-                const currentStock = await getCurrentStockForProduct(initialProduct.id);
-                if (!cancelled) {
-                    setInitialStock(currentStock.map((stock) => ({
-                        ...stock,
-                        id: stock.id ?? crypto.randomUUID(),
-                        batchNumber: stock.batchNumber ?? "",
-                        expiryDate: stock.expiryDate ?? "",
-                    })));
-                }
-            } catch (stockError) {
-                console.error("Failed to load current stock:", stockError);
-                if (!cancelled) setInitialStock([]);
-            }
-        };
-
-        void loadCurrentStock();
+        setInitialStock([]);
         setError("");
         setDuplicateMatch(null);
         setDismissedDuplicateKey(null);
-
-        return () => {
-            cancelled = true;
-        };
     }, [initialProduct]);
 
     const refreshDuplicateWarning = (nextForm: FormData) => {
@@ -626,7 +607,11 @@ const CreateProductForm = ({
 
         try {
             setError("");
-            await onSave(savedProduct, initialStock, isEditing ? trimmedEditReason : undefined);
+            if (isEditing) {
+                await onEdit(savedProduct, trimmedEditReason);
+            } else {
+                await onSave(savedProduct, initialStock);
+            }
         } catch (submitError) {
             console.error(submitError);
             setError(submitError instanceof Error ? submitError.message : "Something went wrong while saving the product");
@@ -816,6 +801,7 @@ const CreateProductForm = ({
                 </>
             )}
 
+            {canEditInitialStock && <>
             <h4>2. {isEditing ? "Current Stock" : "Initial Stock"}</h4>
             {variants.map((variant, index) => {
                 const stockEntry = getVariantStockEntries(variant.id)[0];
@@ -905,8 +891,9 @@ const CreateProductForm = ({
                     </div>
                 );
             })}
+            </>}
 
-            <h4>3. Variants & Packaging</h4>
+            <h4>{canEditInitialStock ? "3" : "2"}. Variants & Packaging</h4>
 
             {!isMultiVariant ? (
                 <div>

@@ -98,11 +98,11 @@ export const getDeliveryRowById = async (id: string): Promise<Delivery | null> =
     };
 };
 
-export const selectDeliveryIdsById = async (
+export const selectDeliveryStatusById = async (
     db: SqliteDatabase,
     id: string
-): Promise<Array<{ id: string }>> => db.select<Array<{ id: string }>>(
-    `SELECT id FROM deliveries WHERE id = ?`,
+): Promise<Array<{ id: string; status: "draft" | "approved" }>> => db.select<Array<{ id: string; status: "draft" | "approved" }>>(
+    `SELECT id, status FROM deliveries WHERE id = ?`,
     [id]
 );
 

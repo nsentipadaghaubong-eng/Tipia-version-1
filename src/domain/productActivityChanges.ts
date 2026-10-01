@@ -1,17 +1,6 @@
 import type { Product, Variant, PackagingUnit } from "../types/Product";
 import type { ActivityChange, ActivityChangeValue } from "../types/Activity";
 
-type ProductStockSnapshot = {
-    id: string;
-    variantId: string;
-    packagingUnitId: string;
-    quantity: number;
-    batchNumber: string | null;
-    expiryDate: string | null;
-    costPrice: number;
-    sellingPrice: number;
-};
-
 const asValue = (value: ActivityChangeValue | undefined): ActivityChangeValue => value ?? null;
 
 const productFieldChanges = (before: Product, after: Product, changes: ActivityChange[]) => {
@@ -136,97 +125,12 @@ const variantAndPackagingChanges = (before: Product, after: Product, changes: Ac
     }
 };
 
-const stockLabel = (product: Product, stock: ProductStockSnapshot) => {
-    const variant = product.variants.find((candidate) => candidate.id === stock.variantId);
-    const unit = variant?.packagingUnits.find((candidate) => candidate.id === stock.packagingUnitId);
-    const variantName = variant ? variantLabel(variant, product.variants.indexOf(variant)) : "Variant";
-    const batch = stock.batchNumber ? `, batch ${stock.batchNumber}` : "";
-    return `${variantName} / ${unit?.name || "Unit"}${batch}`;
-};
-
-const stockDescription = (product: Product, stock: ProductStockSnapshot) => {
-    const variant = product.variants.find((candidate) => candidate.id === stock.variantId);
-    const unit = variant?.packagingUnits.find((candidate) => candidate.id === stock.packagingUnitId);
-    return [
-        `${stock.quantity} ${unit?.name || "unit"}`,
-        `batch ${stock.batchNumber || "none"}`,
-        `expiry ${stock.expiryDate || "none"}`,
-        `cost ${stock.costPrice}`,
-        `selling ${stock.sellingPrice}`,
-    ].join(", ");
-};
-
-const stockPackagingLabel = (product: Product, stock: ProductStockSnapshot) => {
-    const variant = product.variants.find((candidate) => candidate.id === stock.variantId);
-    const unit = variant?.packagingUnits.find((candidate) => candidate.id === stock.packagingUnitId);
-    const variantName = variant ? variantLabel(variant, product.variants.indexOf(variant)) : "Variant";
-    return `${variantName} / ${unit?.name || "Unit"}`;
-};
-
-const stockChanges = (
-    beforeProduct: Product,
-    afterProduct: Product,
-    beforeRows: ProductStockSnapshot[],
-    afterRows: ProductStockSnapshot[],
-    changes: ActivityChange[]
-) => {
-    const beforeById = new Map(beforeRows.map((row) => [row.id, row]));
-    const afterById = new Map(afterRows.map((row) => [row.id, row]));
-    const ids = new Set([...beforeById.keys(), ...afterById.keys()]);
-
-    for (const id of ids) {
-        const oldRow = beforeById.get(id);
-        const newRow = afterById.get(id);
-        if (!oldRow || !newRow) {
-            const row = oldRow ?? newRow!;
-            changes.push({
-                field: `Stock entry (${stockLabel(oldRow ? beforeProduct : afterProduct, row)})`,
-                before: oldRow ? stockDescription(beforeProduct, oldRow) : null,
-                after: newRow ? stockDescription(afterProduct, newRow) : null,
-            });
-            continue;
-        }
-
-        const context = stockLabel(beforeProduct, oldRow);
-        const addStockField = (field: string, oldValue: ActivityChangeValue | undefined, newValue: ActivityChangeValue | undefined) => {
-            const beforeValue = asValue(oldValue);
-            const afterValue = asValue(newValue);
-            if (!Object.is(beforeValue, afterValue)) {
-                changes.push({ field: `${field} (${context})`, before: beforeValue, after: afterValue });
-            }
-        };
-
-        addStockField("Stock quantity", oldRow.quantity, newRow.quantity);
-        if (oldRow.variantId !== newRow.variantId || oldRow.packagingUnitId !== newRow.packagingUnitId) {
-            changes.push({
-                field: `Stock packaging unit (${context})`,
-                before: stockPackagingLabel(beforeProduct, oldRow),
-                after: stockPackagingLabel(afterProduct, newRow),
-            });
-        }
-        const addOptionalStringStockField = (field: string, oldValue: string | null, newValue: string | null) => {
-            const beforeValue = oldValue || null;
-            const afterValue = newValue || null;
-            if (!Object.is(beforeValue, afterValue)) {
-                changes.push({ field: `${field} (${context})`, before: beforeValue, after: afterValue });
-            }
-        };
-        addOptionalStringStockField("Batch number", oldRow.batchNumber, newRow.batchNumber);
-        addOptionalStringStockField("Expiry date", oldRow.expiryDate, newRow.expiryDate);
-        addStockField("Stock cost price", oldRow.costPrice, newRow.costPrice);
-        addStockField("Stock selling price", oldRow.sellingPrice, newRow.sellingPrice);
-    }
-};
-
 export const getProductActivityChanges = (
     before: Product,
-    after: Product,
-    beforeStock: ProductStockSnapshot[] = [],
-    afterStock: ProductStockSnapshot[] = []
+    after: Product
 ): ActivityChange[] => {
     const changes: ActivityChange[] = [];
     productFieldChanges(before, after, changes);
     variantAndPackagingChanges(before, after, changes);
-    stockChanges(before, after, beforeStock, afterStock, changes);
     return changes;
 };

@@ -5,14 +5,13 @@ import CreateProductForm from "../components/CreateProductForm";
 import {
     getProducts,
     getDeliveries,
-    receiveDelivery,
-    saveDeliveryDraft,
     INVENTORY_CHANGED_EVENT,
     PENDING_TASKS_CHANGED_EVENT,
     initializeDatabase,
     createProduct,
     updateProduct,
 } from "../database/database";
+import { receiveDelivery, saveDeliveryDraft } from "../database/deliveryWorkflow";
 import { formatExpiryStatus } from "../utils/expiry";
 
 const createNewDeliveryState = (): Delivery => ({
@@ -445,18 +444,7 @@ const ReceiveDelivery = () => {
                     <CreateProductForm
                         existingProducts={products}
                         initialProduct={editingExistingProduct}
-                        onSave={async (savedProduct, stockEntries, editReason) => {
-                            if (editingExistingProduct) {
-                                await updateProduct(savedProduct, editReason ?? "", stockEntries);
-                                const refreshedProducts = await getProducts();
-                                setProducts(refreshedProducts);
-                                setShowCreateProduct(false);
-                                setEditingExistingProduct(null);
-                                selectProduct(savedProduct);
-                                setError("");
-                                return;
-                            }
-
+                        onSave={async (savedProduct, stockEntries) => {
                             await createProduct(savedProduct, stockEntries);
                             const refreshedProducts = await getProducts();
                             setProducts(refreshedProducts);
@@ -470,6 +458,16 @@ const ReceiveDelivery = () => {
                             }
                             setError("");
                         }}
+                        onEdit={async (savedProduct, editReason) => {
+                            await updateProduct(savedProduct, editReason);
+                            const refreshedProducts = await getProducts();
+                            setProducts(refreshedProducts);
+                            setShowCreateProduct(false);
+                            setEditingExistingProduct(null);
+                            selectProduct(savedProduct);
+                            setError("");
+                        }}
+                        showStockFields={!editingExistingProduct}
                         onCancel={() => {
                             setShowCreateProduct(false);
                             setEditingExistingProduct(null);

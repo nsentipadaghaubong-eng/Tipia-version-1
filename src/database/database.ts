@@ -50,11 +50,6 @@ import {
     createDeliveryItem as createDeliveryItemRow,
     getDeliveryRows,
     getDeliveryRowById,
-    selectDeliveryIdsById,
-    insertDeliveryRowWithStatus,
-    updateDeliveryRow,
-    deleteDeliveryItemsByDeliveryId,
-    insertDeliveryItemRow,
     getDeliveryItemReferencesByVariant,
     getDeliveryItemReferencesByPackagingUnit,
 } from "./deliveryRepository";
@@ -558,8 +553,7 @@ export const createProduct = async (
 
 export const updateProduct = async (
     product: Product,
-    editReason: string,
-    stockEntries: InventoryStockEntryInput[] = []
+    editReason: string
 ) => {
     const normalizedReason = editReason.trim();
     if (!normalizedReason) {
@@ -576,7 +570,6 @@ export const updateProduct = async (
         if (!existingProduct) {
             throw new Error(`Product ${product.id} does not exist`);
         }
-        const stockBefore = await selectRawInventoryStockRows(db, { productId: product.id });
 
         // --------------------------------------------------
         // 1. Update basic product information
@@ -720,29 +713,7 @@ export const updateProduct = async (
             }
         }
 
-        for (const stock of stockEntries) {
-            if (!stock.packagingUnitId) {
-                continue;
-            }
-
-            const normalizedQuantity = Number(stock.quantity);
-            if (!Number.isFinite(normalizedQuantity) || normalizedQuantity < 0) {
-                throw new Error(`Stock quantity for ${stock.packagingUnitId} cannot be negative`);
-            }
-
-            await setInventoryStockEntry(db, product.id, {
-                id: stock.id,
-                packagingUnitId: stock.packagingUnitId,
-                quantity: normalizedQuantity,
-                batchNumber: stock.batchNumber,
-                expiryDate: stock.expiryDate,
-                costPrice: stock.costPrice,
-                sellingPrice: stock.sellingPrice,
-            });
-        }
-
-        const stockAfter = await selectRawInventoryStockRows(db, { productId: product.id });
-        const changes = getProductActivityChanges(existingProduct, product, stockBefore, stockAfter);
+        const changes = getProductActivityChanges(existingProduct, product);
         const isArchiveTransition = existingProduct.status !== "archived" && product.status === "archived";
         await recordActivity(db, {
             eventType: isArchiveTransition ? "product.archived" : "product.edited",
@@ -980,113 +951,6 @@ export const getDeliveries = async (): Promise<Delivery[]> => {
 
 export const getDeliveryById = async (id: string): Promise<Delivery | null> => {
     return await getDeliveryRowById(id);
-};
-
-export const saveDeliveryDraft = async (delivery: Delivery) => {
-    const db = await loadDatabase();
-
-    try {
-        await db.execute(`PRAGMA foreign_keys = ON;`);
-        await db.execute(`BEGIN`);
-
-        const existingDelivery = await selectDeliveryIdsById(db, delivery.id);
-
-        if (existingDelivery.length > 0) {
-            await updateDeliveryRow(db, delivery, "draft");
-        } else {
-            await insertDeliveryRowWithStatus(db, delivery, "draft");
-        }
-
-        await deleteDeliveryItemsByDeliveryId(db, delivery.id);
-
-        for (const item of delivery.items) {
-            await insertDeliveryItemRow(db, item);
-        }
-
-        await db.execute(`COMMIT`);
-        return { success: true, deliveryId: delivery.id };
-    } catch (error) {
-        await db.execute(`ROLLBACK`);
-        throw error;
-    }
-};
-
-export const receiveDelivery = async (delivery: Delivery) => {
-    const db = await loadDatabase();
-
-    try {
-        await db.execute(`PRAGMA foreign_keys = ON;`);
-        await db.execute(`BEGIN`);
-
-        if (delivery.status === "draft") {
-            await db.execute(`ROLLBACK`);
-            throw new Error("Draft delivery must be saved using saveDeliveryDraft without creating stock.");
-        }
-
-        const existingDelivery = await selectDeliveryIdsById(db, delivery.id);
-
-        if (existingDelivery.length > 0) {
-            await updateDeliveryRow(db, delivery, "approved");
-            await deleteDeliveryItemsByDeliveryId(db, delivery.id);
-        } else {
-            await insertDeliveryRowWithStatus(db, delivery, "approved");
-        }
-
-        for (const item of delivery.items) {
-            await insertDeliveryItemRow(db, item);
-            await addInventoryStock(db, item);
-        }
-
-        const deliveryProducts = new Map<string, Product | null>();
-        for (const item of delivery.items) {
-            if (!deliveryProducts.has(item.productId)) {
-                deliveryProducts.set(item.productId, await getProductActivitySnapshot(db, item.productId));
-            }
-        }
-
-        await recordActivity(db, {
-            eventType: "delivery.received",
-            entityType: "delivery",
-            entityId: delivery.id,
-            entityLabel: `Invoice ${delivery.invoiceNo}`,
-            summary: `Delivery from ${delivery.supplier} received on ${delivery.date} by ${delivery.receivedBy} (${delivery.items.length} item${delivery.items.length === 1 ? "" : "s"})`,
-            reason: null,
-            details: {
-                supplier: delivery.supplier,
-                invoiceNo: delivery.invoiceNo,
-                deliveryDate: delivery.date,
-                receivedBy: delivery.receivedBy,
-                items: delivery.items.map((item) => {
-                    const productSnapshot = deliveryProducts.get(item.productId) ?? null;
-                    const variant = productSnapshot?.variants.find((entry) => entry.id === item.variantId);
-                    const packagingUnit = variant?.packagingUnits.find((unit) => unit.id === item.packagingUnitId);
-                    return {
-                        productId: item.productId,
-                        productName: productSnapshot?.name ?? null,
-                        variantId: item.variantId,
-                        variantLabel: getActivityVariantLabel(variant),
-                        packagingUnitId: item.packagingUnitId,
-                        packagingUnitName: packagingUnit?.name ?? null,
-                        quantity: item.quantity,
-                        batchNumber: item.batchNumber ?? null,
-                        expiryDate: item.expiryDate ?? null,
-                        costPrice: item.costPrice,
-                        sellingPrice: item.sellingPrice,
-                    };
-                }),
-            },
-        });
-
-        await db.execute(`COMMIT`);
-
-        return {
-            success: true,
-            deliveryId: delivery.id,
-        };
-    } catch (error) {
-        await db.execute(`ROLLBACK`);
-        throw error;
-    }
 };
 
 export const getSmallestPackagingUnit = (variant: Variant): PackagingUnit | null => {

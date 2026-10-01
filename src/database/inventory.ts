@@ -1,6 +1,10 @@
 import type { SqliteDatabase } from "./connection";
 import type { DeliveryItems } from "../types/Product";
 import {
+    selectPackagingUnitIdByIdAndVariantId,
+    selectVariantIdByIdAndProductId,
+} from "./productRepository";
+import {
     deleteInventoryStockById,
     getInventoryStockBatchCandidates,
     incrementInventoryStockQuantityById,
@@ -28,6 +32,15 @@ export const addInventoryStock = async (
 ) => {
     if (!Number.isFinite(item.quantity) || item.quantity < 0 || !Number.isInteger(item.quantity)) {
         throw new Error("Stock quantity must be a non-negative whole number");
+    }
+
+    const matchingVariants = await selectVariantIdByIdAndProductId(db, item.variantId, item.productId);
+    if (matchingVariants.length === 0) {
+        throw new Error("Delivery item Variant must belong to its Product.");
+    }
+    const matchingPackagingUnits = await selectPackagingUnitIdByIdAndVariantId(db, item.packagingUnitId, item.variantId);
+    if (matchingPackagingUnits.length === 0) {
+        throw new Error("Delivery item Packaging Unit must belong to its Variant and Product.");
     }
 
     const existingRows = await getInventoryStockBatchCandidates(

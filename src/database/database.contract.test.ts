@@ -18,11 +18,10 @@ import {
     getVariantAvailabilityByPackagingUnit,
     initializeDatabase,
     deleteProduct,
-    receiveDelivery,
-    saveDeliveryDraft,
     saveSaleDraft,
     updateProduct,
 } from "./database";
+import { receiveDelivery, saveDeliveryDraft } from "./deliveryWorkflow";
 import { addInventoryStock, setInventoryStockEntry } from "./inventory";
 import * as activityRepository from "./activityRepository";
 import type { Delivery, DeliveryItems, PackagingUnit, Product, Sale } from "../types/Product";
@@ -56,6 +55,8 @@ type TestState = {
     inventory: StockRow[];
     activities: ActivityRecord[];
     deliveries: string[];
+    deliveryStatuses: Record<string, string>;
+    deliveryHeaders: Record<string, Omit<Delivery, "items" | "status">>;
     deliveryItems: unknown[][];
     sales: string[];
     saleStatuses: Record<string, string>;
@@ -68,10 +69,12 @@ type TestDatabase = {
     execute: ReturnType<typeof vi.fn>;
     failures: {
         activityInsert: boolean;
+        productUpdate: boolean;
         inventoryUpdate: boolean;
         inventoryUpdateOnCall: number | null;
         inventoryInsert: boolean;
         deliveryItemInsert: boolean;
+        deliveryUpdate: boolean;
     };
 };
 
@@ -165,6 +168,8 @@ const makeDatabase = (initialInventory: StockRow[] = []): TestDatabase => {
         inventory: initialInventory.map((row) => ({ ...row })),
         activities: [],
         deliveries: [],
+        deliveryStatuses: {},
+        deliveryHeaders: {},
         deliveryItems: [],
         sales: [],
         saleStatuses: {},
@@ -172,10 +177,12 @@ const makeDatabase = (initialInventory: StockRow[] = []): TestDatabase => {
     };
     const failures = {
         activityInsert: false,
+        productUpdate: false,
         inventoryUpdate: false,
         inventoryUpdateOnCall: null as number | null,
         inventoryInsert: false,
         deliveryItemInsert: false,
+        deliveryUpdate: false,
     };
     let inventoryUpdateCalls = 0;
     let transactionSnapshot: TestState | null = null;
@@ -191,7 +198,9 @@ const makeDatabase = (initialInventory: StockRow[] = []): TestDatabase => {
             }
             if (sql.includes("WHERE id = ?")) {
                 const unitId = String(bindings[0]);
-                const matchingUnit = state.packagingUnits.find((unit) => unit.id === unitId);
+                const matchingUnit = state.packagingUnits.find((unit) => unit.id === unitId)
+                    ?? packagingRows.find((unit) => unit.id === unitId);
+                if (sql.includes("AND variant_id = ?") && matchingUnit?.variantId !== String(bindings[1])) return [];
                 return [{ variantId: matchingUnit?.variantId ?? "variant-1", id: unitId }];
             }
             return [];
@@ -271,7 +280,10 @@ const makeDatabase = (initialInventory: StockRow[] = []): TestDatabase => {
             return [];
         }
         if (sql.includes("FROM deliveries")) {
-            return state.deliveries.includes(String(bindings[0])) ? [{ id: bindings[0] }] : [];
+            const deliveryId = String(bindings[0]);
+            return state.deliveries.includes(deliveryId)
+                ? [{ id: deliveryId, status: state.deliveryStatuses[deliveryId] ?? "draft" }]
+                : [];
         }
         if (sql.includes("FROM sales")) {
             const saleId = String(bindings[0]);
@@ -312,6 +324,8 @@ const makeDatabase = (initialInventory: StockRow[] = []): TestDatabase => {
             state.products.push(String(bindings[0]));
             state.productNames[String(bindings[0])] = String(bindings[1]);
             state.productStatuses[String(bindings[0])] = String(bindings[11]);
+        } else if (sql.includes("UPDATE products") && failures.productUpdate) {
+            throw new Error("Product update failed");
         } else if (sql.includes("UPDATE products") && sql.includes("status = 'archived'")) {
             state.productStatuses[String(bindings[0])] = "archived";
         } else if (sql.includes("UPDATE products")) {
@@ -377,8 +391,30 @@ const makeDatabase = (initialInventory: StockRow[] = []): TestDatabase => {
             if (row) Object.assign(row, { variantId, packagingUnitId, quantity, batchNumber, expiryDate, costPrice, sellingPrice });
         } else if (sql.includes("DELETE FROM inventory_stock")) {
             state.inventory = state.inventory.filter((row) => row.id !== bindings[0]);
+        } else if (sql.includes("UPDATE deliveries")) {
+            if (failures.deliveryUpdate) throw new Error("Delivery update failed");
+            const [supplier, invoiceNo, date, receivedBy, status, id] = bindings;
+            const deliveryId = String(id);
+            state.deliveryStatuses[deliveryId] = String(status);
+            state.deliveryHeaders[deliveryId] = {
+                id: deliveryId,
+                supplier: String(supplier),
+                invoiceNo: String(invoiceNo),
+                date: String(date),
+                receivedBy: String(receivedBy),
+            };
         } else if (sql.includes("INSERT INTO deliveries")) {
-            state.deliveries.push(String(bindings[0]));
+            const [id, supplier, invoiceNo, date, receivedBy, status] = bindings;
+            const deliveryId = String(id);
+            state.deliveries.push(deliveryId);
+            state.deliveryStatuses[deliveryId] = String(status ?? "draft");
+            state.deliveryHeaders[deliveryId] = {
+                id: deliveryId,
+                supplier: String(supplier),
+                invoiceNo: String(invoiceNo),
+                date: String(date),
+                receivedBy: String(receivedBy),
+            };
         } else if (sql.includes("INSERT INTO delivery_items")) {
             if (failures.deliveryItemInsert) throw new Error("Delivery item insert failed");
             state.deliveryItems.push(bindings);
@@ -749,7 +785,7 @@ describe("Product Activity workflow", () => {
         expect(loadMock).not.toHaveBeenCalled();
     });
 
-    it("records one Product edit with the trimmed reason and entity details", async () => {
+    it("updates Product metadata without mutating stock and records Product-only Activity", async () => {
         const stock = makeStockRow({
             id: "stock-pack-1",
             packagingUnitId: "pack",
@@ -762,18 +798,11 @@ describe("Product Activity workflow", () => {
         installDatabase(db);
         const changedProduct = { ...product, name: "Corrected medicine" };
 
-        await updateProduct(changedProduct, "  Incorrect price  ", [{
-            id: stock.id,
-            packagingUnitId: stock.packagingUnitId,
-            quantity: 3,
-            batchNumber: stock.batchNumber ?? undefined,
-            expiryDate: stock.expiryDate ?? undefined,
-            costPrice: stock.costPrice,
-            sellingPrice: stock.sellingPrice,
-        }]);
+        await updateProduct(changedProduct, "  Incorrect price  ");
 
         expect(db.state.productNames[product.id]).toBe("Corrected medicine");
-        expect(db.state.inventory[0].quantity).toBe(3);
+        expect(db.state.inventory).toEqual([stock]);
+        expect(db.execute.mock.calls.some(([sql]) => sql.includes("UPDATE inventory_stock"))).toBe(false);
         expect(db.state.activities).toHaveLength(1);
         expect(db.state.activities[0]).toMatchObject({
             eventType: "product.edited",
@@ -785,16 +814,11 @@ describe("Product Activity workflow", () => {
         });
         expect(db.state.activities[0].changes).toEqual([
             { field: "Product name", before: "Test medicine", after: "Corrected medicine" },
-            {
-                field: "Stock quantity (10 mg Tablet / Pack, batch batch-sachet)",
-                before: 2,
-                after: 3,
-            },
         ]);
         expect(db.execute).toHaveBeenCalledWith("COMMIT");
     });
 
-    it("captures multiple Product, price, and expiry changes with exact before and after values", async () => {
+    it("captures Product, variant, packaging, and Product-level price changes", async () => {
         const stock = makeStockRow({
             id: "stock-pack-1",
             packagingUnitId: "pack",
@@ -820,15 +844,7 @@ describe("Product Activity workflow", () => {
             })),
         };
 
-        await updateProduct(changedProduct, "Supplier provided corrected product information", [{
-            id: stock.id,
-            packagingUnitId: stock.packagingUnitId,
-            quantity: stock.quantity,
-            batchNumber: stock.batchNumber ?? undefined,
-            expiryDate: "2027-10-15",
-            costPrice: stock.costPrice,
-            sellingPrice: stock.sellingPrice,
-        }]);
+        await updateProduct(changedProduct, "Supplier provided corrected product information");
 
         expect(db.state.activities).toHaveLength(1);
         expect(db.state.activities[0]).toMatchObject({
@@ -840,14 +856,15 @@ describe("Product Activity workflow", () => {
             { field: "Variant 10 mg Tablet / Strength", before: "10", after: "20" },
             { field: "Packaging Pack / Contains quantity", before: 12, after: 6 },
             { field: "Packaging Pack / Selling price", before: 700, after: 600 },
-            {
-                field: "Expiry date (10 mg Tablet / Pack, batch batch-sachet)",
-                before: "2026-10-15",
-                after: "2027-10-15",
-            },
         ]);
+        expect(db.state.inventory).toEqual([stock]);
+        expect(db.state.productSnapshots[product.id].variants[0].strength).toBe("20");
+        expect(db.state.packagingUnits.find((unit) => unit.id === "pack")).toMatchObject({
+            containsQuantity: 6,
+            sellingPrice: 600,
+        });
         expect(db.state.activities[0].changes).not.toContainEqual(expect.objectContaining({ field: "Generic name" }));
-        expect(db.state.activities[0].changes).not.toContainEqual(expect.objectContaining({ field: expect.stringContaining("Stock quantity") }));
+        expect(db.state.activities[0].changes).not.toContainEqual(expect.objectContaining({ field: expect.stringMatching(/Stock quantity|Stock packaging|Batch number|Expiry date|Stock cost price|Stock selling price/) }));
     });
 
     it("preserves the existing edit event semantics with an empty change list when nothing changed", async () => {
@@ -864,19 +881,12 @@ describe("Product Activity workflow", () => {
         installExistingProduct(db);
         installDatabase(db);
 
-        await updateProduct(product, "Reviewed and confirmed", [{
-            id: stock.id,
-            packagingUnitId: stock.packagingUnitId,
-            quantity: stock.quantity,
-            batchNumber: "",
-            expiryDate: "",
-            costPrice: stock.costPrice,
-            sellingPrice: stock.sellingPrice,
-        }]);
+        await updateProduct(product, "Reviewed and confirmed");
 
         expect(db.state.activities).toHaveLength(1);
         expect(db.state.activities[0].eventType).toBe("product.edited");
         expect(db.state.activities[0].changes).toEqual([]);
+        expect(db.state.inventory).toEqual([stock]);
     });
 
     it("rolls back Product changes when Activity insertion fails", async () => {
@@ -893,37 +903,52 @@ describe("Product Activity workflow", () => {
         expect(db.execute).toHaveBeenCalledWith("ROLLBACK");
     });
 
-    it("rolls back Product and stock changes when the Inventory stock edit fails", async () => {
+    it("does not call the Inventory writer during Product editing", async () => {
         const stock = makeStockRow({ id: "stock-pack-1", packagingUnitId: "pack", quantity: 2 });
         const db = makeDatabase([stock]);
         installExistingProduct(db);
         db.failures.inventoryUpdate = true;
         installDatabase(db);
 
-        await expect(updateProduct({ ...product, name: "Changed name" }, "Correction", [{
-            id: stock.id,
-            packagingUnitId: stock.packagingUnitId,
-            quantity: 5,
-            batchNumber: stock.batchNumber ?? undefined,
-            expiryDate: stock.expiryDate ?? undefined,
-            costPrice: stock.costPrice,
-            sellingPrice: stock.sellingPrice,
-        }])).rejects.toThrow("Inventory update failed");
+        await updateProduct({ ...product, name: "Changed name" }, "Correction");
+
+        expect(db.state.productNames[product.id]).toBe("Changed name");
+        expect(db.state.inventory).toEqual([stock]);
+        expect(db.execute.mock.calls.some(([sql]) => sql.includes("UPDATE inventory_stock"))).toBe(false);
+        expect(db.state.activities[0].changes).toEqual([
+            { field: "Product name", before: product.name, after: "Changed name" },
+        ]);
+    });
+
+    it("exposes only Product and reason parameters for Product edits", () => {
+        expectTypeOf(updateProduct).parameters.toEqualTypeOf<[Product, string]>();
+    });
+
+    it("rolls back a Product edit when Product persistence fails", async () => {
+        const db = makeDatabase();
+        installExistingProduct(db);
+        db.failures.productUpdate = true;
+        installDatabase(db);
+
+        await expect(updateProduct({ ...product, name: "Changed name" }, "Correction"))
+            .rejects.toThrow("Product update failed");
 
         expect(db.state.productNames[product.id]).toBe(product.name);
-        expect(db.state.inventory).toEqual([stock]);
         expect(db.state.activities).toEqual([]);
         expect(db.execute).toHaveBeenCalledWith("ROLLBACK");
     });
 
     it("records a Product archive through the edit form as one archive event", async () => {
-        const db = makeDatabase();
+        const stock = makeStockRow({ id: "stock-pack-1", packagingUnitId: "pack", quantity: 2 });
+        const db = makeDatabase([stock]);
         installExistingProduct(db);
         installDatabase(db);
 
         await updateProduct({ ...product, status: "archived" }, "No longer stocked");
 
         expect(db.state.productStatuses[product.id]).toBe("archived");
+        expect(db.state.inventory).toEqual([stock]);
+        expect(db.execute.mock.calls.some(([sql]) => sql.includes("inventory_stock"))).toBe(false);
         expect(db.state.activities).toHaveLength(1);
         expect(db.state.activities[0].eventType).toBe("product.archived");
         expect(db.state.activities[0].changes).toContainEqual({
@@ -934,13 +959,16 @@ describe("Product Activity workflow", () => {
     });
 
     it("records a successful standalone soft archive", async () => {
-        const db = makeDatabase();
+        const stock = makeStockRow({ id: "stock-pack-1", packagingUnitId: "pack", quantity: 2 });
+        const db = makeDatabase([stock]);
         installExistingProduct(db);
         installDatabase(db);
 
         await deleteProduct(product.id);
 
         expect(db.state.productStatuses[product.id]).toBe("archived");
+        expect(db.state.inventory).toEqual([stock]);
+        expect(db.execute.mock.calls.some(([sql]) => sql.includes("inventory_stock"))).toBe(false);
         expect(db.state.activities).toHaveLength(1);
         expect(db.state.activities[0]).toMatchObject({
             eventType: "product.archived",
@@ -1031,6 +1059,7 @@ describe("Stage 1 behavior characterization", () => {
 
         it("Inventory increments a matching physical-unit batch", async () => {
             const db = makeDatabase([makeStockRow({ quantity: 4 })]);
+            installExistingProduct(db);
 
             await addInventoryStock(db as never, { ...deliveryItem, packagingUnitId: "sachet", quantity: 3, batchNumber: "batch-sachet", expiryDate: "2027-01-01" });
 
@@ -1097,6 +1126,23 @@ describe("Stage 1 behavior characterization", () => {
     });
 
     describe("persistence-contract: deliveries", () => {
+        const makeExistingDraftDatabase = () => {
+            const db = makeDatabase([makeStockRow({ quantity: 4 })]);
+            installExistingProduct(db);
+            db.state.deliveries.push("delivery-1");
+            db.state.deliveryStatuses["delivery-1"] = "draft";
+            db.state.deliveryHeaders["delivery-1"] = {
+                id: "delivery-1",
+                supplier: "Original Supplier",
+                invoiceNo: "INV-OLD",
+                date: "2026-09-27",
+                receivedBy: "Original Recipient",
+            };
+            db.state.deliveryItems.push(["prior-delivery-item"]);
+            installDatabase(db);
+            return { db, before: structuredClone(db.state) };
+        };
+
         it("saving a delivery draft leaves physical inventory unchanged", async () => {
             const existingStock = makeStockRow({ quantity: 4 });
             const db = makeDatabase([existingStock]);
@@ -1158,6 +1204,8 @@ describe("Stage 1 behavior characterization", () => {
                 packagingUnitId: "pack",
                 quantity: 2,
                 batchNumber: "batch-1",
+                costPrice: deliveryItem.costPrice,
+                sellingPrice: deliveryItem.sellingPrice,
             })]);
             expect(db.state.deliveries).toEqual(["delivery-1"]);
             expect(db.state.deliveryItems).toHaveLength(1);
@@ -1191,6 +1239,64 @@ describe("Stage 1 behavior characterization", () => {
                 },
             });
             expect(db.execute).toHaveBeenCalledWith("COMMIT");
+        });
+
+        it("rejects repeated approval without changing the Delivery, stock, or Activity", async () => {
+            const db = makeDatabase();
+            installExistingProduct(db);
+            installDatabase(db);
+            const approvedDelivery: Delivery = {
+                id: "delivery-1",
+                supplier: "Supplier",
+                invoiceNo: "INV-1",
+                date: "2026-09-28",
+                receivedBy: "Tester",
+                status: "approved",
+                items: [deliveryItem],
+            };
+
+            await receiveDelivery(approvedDelivery);
+            await expect(receiveDelivery(approvedDelivery)).rejects.toThrow("has already been approved");
+
+            expect(db.state.deliveryStatuses[approvedDelivery.id]).toBe("approved");
+            expect(db.state.inventory).toEqual([expect.objectContaining({
+                productId: "product-1",
+                variantId: "variant-1",
+                packagingUnitId: "pack",
+                quantity: 2,
+            })]);
+            expect(db.state.deliveryItems).toHaveLength(1);
+            expect(db.state.activities).toHaveLength(1);
+            expect(db.state.activities[0].eventType).toBe("delivery.received");
+        });
+
+        it("rejects saving an approved Delivery as a draft without changing its state", async () => {
+            const db = makeDatabase();
+            installExistingProduct(db);
+            installDatabase(db);
+            const approvedDelivery: Delivery = {
+                id: "delivery-1",
+                supplier: "Supplier",
+                invoiceNo: "INV-1",
+                date: "2026-09-28",
+                receivedBy: "Tester",
+                status: "approved",
+                items: [deliveryItem],
+            };
+
+            await receiveDelivery(approvedDelivery);
+            await expect(saveDeliveryDraft({
+                ...approvedDelivery,
+                supplier: "Updated Supplier",
+                status: "draft",
+                items: [{ ...deliveryItem, quantity: 5 }],
+            })).rejects.toThrow("cannot be edited as a draft");
+
+            expect(db.state.deliveryStatuses[approvedDelivery.id]).toBe("approved");
+            expect(db.state.deliveryHeaders[approvedDelivery.id].supplier).toBe("Supplier");
+            expect(db.state.deliveryItems[0][5]).toBe(2);
+            expect(db.state.inventory).toEqual([expect.objectContaining({ quantity: 2 })]);
+            expect(db.state.activities).toHaveLength(1);
         });
 
         it("records all items from a multi-item Delivery in one Activity", async () => {
@@ -1236,6 +1342,54 @@ describe("Stage 1 behavior characterization", () => {
             }
         });
 
+        it.each([
+            {
+                description: "a Variant belonging to another Product",
+                variantId: "variant-2",
+                packagingUnitId: "other-pack",
+            },
+            {
+                description: "a Packaging Unit belonging to another Variant",
+                variantId: "variant-1",
+                packagingUnitId: "other-pack",
+            },
+        ])("rejects a Delivery item with $description", async ({ variantId, packagingUnitId }) => {
+            const db = makeDatabase();
+            installExistingProduct(db);
+            db.state.products.push("product-2");
+            db.state.productNames["product-2"] = "Other medicine";
+            db.state.productStatuses["product-2"] = "active";
+            db.state.variants.push("variant-2");
+            db.state.variantProductIds["variant-2"] = "product-2";
+            db.state.packagingUnits.push({
+                id: "other-pack",
+                variantId: "variant-2",
+                name: "Other Pack",
+                level: 1,
+                containsQuantity: null,
+                containsUnitId: null,
+                costPrice: 900,
+                sellingPrice: 1200,
+                isDefault: 1,
+            });
+            installDatabase(db);
+
+            await expect(receiveDelivery({
+                id: "delivery-1",
+                supplier: "Supplier",
+                invoiceNo: "INV-1",
+                date: "2026-09-28",
+                receivedBy: "Tester",
+                status: "approved",
+                items: [{ ...deliveryItem, variantId, packagingUnitId }],
+            })).rejects.toThrow(/must belong/);
+
+            expect(db.state.deliveries).toEqual([]);
+            expect(db.state.deliveryItems).toEqual([]);
+            expect(db.state.inventory).toEqual([]);
+            expect(db.state.activities).toEqual([]);
+        });
+
         it("does not create Activity when receipt validation rejects a draft", async () => {
             const db = makeDatabase();
             installDatabase(db);
@@ -1253,6 +1407,127 @@ describe("Stage 1 behavior characterization", () => {
             expect(db.state.deliveries).toEqual([]);
             expect(db.state.deliveryItems).toEqual([]);
             expect(db.state.activities).toEqual([]);
+        });
+
+        it("rejects a Delivery without an explicit status before changing Delivery, Inventory, or Activity", async () => {
+            const existingStock = makeStockRow({ quantity: 4 });
+            const db = makeDatabase([existingStock]);
+            installExistingProduct(db);
+            db.state.deliveries.push("delivery-1");
+            db.state.deliveryStatuses["delivery-1"] = "draft";
+            db.state.deliveryHeaders["delivery-1"] = {
+                id: "delivery-1",
+                supplier: "Original Supplier",
+                invoiceNo: "INV-OLD",
+                date: "2026-09-27",
+                receivedBy: "Original Recipient",
+            };
+            db.state.deliveryItems.push(["prior-delivery-item"]);
+            installDatabase(db);
+
+            await expect(receiveDelivery({
+                id: "delivery-1",
+                supplier: "Updated Supplier",
+                invoiceNo: "INV-NEW",
+                date: "2026-09-28",
+                receivedBy: "Tester",
+                items: [deliveryItem],
+            })).rejects.toThrow("explicit approved status");
+
+            expect(db.state.deliveryStatuses["delivery-1"]).toBe("draft");
+            expect(db.state.deliveryHeaders["delivery-1"]).toMatchObject({
+                supplier: "Original Supplier",
+                invoiceNo: "INV-OLD",
+                date: "2026-09-27",
+                receivedBy: "Original Recipient",
+            });
+            expect(db.state.deliveryItems).toEqual([["prior-delivery-item"]]);
+            expect(db.state.inventory).toEqual([existingStock]);
+            expect(db.state.activities).toEqual([]);
+        });
+
+        it("rejects an approved Delivery with no items before changing persisted state", async () => {
+            const { db, before } = makeExistingDraftDatabase();
+
+            await expect(receiveDelivery({
+                id: "delivery-1",
+                supplier: "Updated Supplier",
+                invoiceNo: "INV-NEW",
+                date: "2026-09-28",
+                receivedBy: "Tester",
+                status: "approved",
+                items: [],
+            })).rejects.toThrow("Add at least one product to the delivery");
+
+            expect(db.state).toEqual(before);
+            expect(db.execute).not.toHaveBeenCalled();
+        });
+
+        it.each([
+            { label: "zero", quantity: 0, message: "Quantity must be greater than zero" },
+            { label: "negative", quantity: -1, message: "Quantity must be greater than zero" },
+            { label: "fractional", quantity: 1.5, message: "Stock quantity must be a non-negative whole number" },
+        ])("rejects an approved Delivery with $label item quantity before changing persisted state", async ({ quantity, message }) => {
+            const { db, before } = makeExistingDraftDatabase();
+
+            await expect(receiveDelivery({
+                id: "delivery-1",
+                supplier: "Updated Supplier",
+                invoiceNo: "INV-NEW",
+                date: "2026-09-28",
+                receivedBy: "Tester",
+                status: "approved",
+                items: [{ ...deliveryItem, quantity }],
+            })).rejects.toThrow(message);
+
+            expect(db.state).toEqual(before);
+            expect(db.execute).not.toHaveBeenCalled();
+        });
+
+        it.each([
+            { label: "cost price", field: "costPrice", value: -1 },
+            { label: "selling price", field: "sellingPrice", value: -1 },
+        ])("rejects an approved Delivery with negative $label before changing persisted state", async ({ field, value }) => {
+            const { db, before } = makeExistingDraftDatabase();
+            const approvedDelivery: Delivery = {
+                id: "delivery-1",
+                supplier: "Supplier",
+                invoiceNo: "INV-1",
+                date: "2026-09-28",
+                receivedBy: "Tester",
+                status: "approved",
+                items: [{ ...deliveryItem, [field]: value }],
+            };
+
+            await expect(receiveDelivery(approvedDelivery)).rejects.toThrow("Prices cannot be negative");
+
+            expect(db.state).toEqual(before);
+            expect(db.execute).not.toHaveBeenCalled();
+        });
+
+        it.each([
+            { label: "blank supplier", field: "supplier", value: " ", message: "Supplier is required" },
+            { label: "supplier placeholder", field: "supplier", value: "select", message: "Supplier is required" },
+            { label: "blank invoice number", field: "invoiceNo", value: "  ", message: "Invoice No. is required" },
+            { label: "blank date", field: "date", value: "", message: "Date is required" },
+            { label: "blank recipient", field: "receivedBy", value: "\n", message: "Received by is required" },
+        ])("rejects an approved Delivery with $label before changing persisted state", async ({ field, value, message }) => {
+            const { db, before } = makeExistingDraftDatabase();
+            const approvedDelivery: Delivery = {
+                id: "delivery-1",
+                supplier: "Supplier",
+                invoiceNo: "INV-1",
+                date: "2026-09-28",
+                receivedBy: "Tester",
+                status: "approved",
+                items: [deliveryItem],
+            };
+
+            const invalidDelivery = { ...approvedDelivery, [field]: value };
+            await expect(receiveDelivery(invalidDelivery)).rejects.toThrow(message);
+
+            expect(db.state).toEqual(before);
+            expect(db.execute).not.toHaveBeenCalled();
         });
 
         it("rolls back Delivery header and items if Delivery item persistence fails", async () => {
@@ -1276,8 +1551,94 @@ describe("Stage 1 behavior characterization", () => {
             expect(db.state.activities).toEqual([]);
         });
 
+        it("rolls back the Delivery update, items, Inventory, and Activity if matching-row increment fails", async () => {
+            const existingStock = makeStockRow({
+                id: "stock-existing",
+                packagingUnitId: deliveryItem.packagingUnitId,
+                quantity: 4,
+                batchNumber: deliveryItem.batchNumber,
+                expiryDate: deliveryItem.expiryDate,
+            });
+            const db = makeDatabase([existingStock]);
+            installExistingProduct(db);
+            db.state.deliveries.push("delivery-1");
+            db.state.deliveryStatuses["delivery-1"] = "draft";
+            db.state.deliveryHeaders["delivery-1"] = {
+                id: "delivery-1",
+                supplier: "Original Supplier",
+                invoiceNo: "INV-OLD",
+                date: "2026-09-27",
+                receivedBy: "Original Recipient",
+            };
+            db.state.deliveryItems.push(["prior-delivery-item"]);
+            db.failures.inventoryUpdate = true;
+            installDatabase(db);
+
+            await expect(receiveDelivery({
+                id: "delivery-1",
+                supplier: "Updated Supplier",
+                invoiceNo: "INV-NEW",
+                date: "2026-09-28",
+                receivedBy: "Tester",
+                status: "approved",
+                items: [deliveryItem],
+            })).rejects.toThrow("Inventory update failed");
+
+            expect(db.state.deliveryStatuses["delivery-1"]).toBe("draft");
+            expect(db.state.deliveryHeaders["delivery-1"]).toMatchObject({
+                supplier: "Original Supplier",
+                invoiceNo: "INV-OLD",
+                date: "2026-09-27",
+                receivedBy: "Original Recipient",
+            });
+            expect(db.state.deliveryItems).toEqual([["prior-delivery-item"]]);
+            expect(db.state.inventory).toEqual([existingStock]);
+            expect(db.state.activities).toEqual([]);
+            expect(db.execute).toHaveBeenCalledWith("ROLLBACK");
+        });
+
+        it("rolls back approval when Delivery status/header persistence fails", async () => {
+            const existingStock = makeStockRow({ quantity: 4 });
+            const db = makeDatabase([existingStock]);
+            db.state.deliveries.push("delivery-1");
+            db.state.deliveryStatuses["delivery-1"] = "draft";
+            db.state.deliveryHeaders["delivery-1"] = {
+                id: "delivery-1",
+                supplier: "Original Supplier",
+                invoiceNo: "INV-OLD",
+                date: "2026-09-27",
+                receivedBy: "Original Recipient",
+            };
+            db.state.deliveryItems.push(["prior-delivery-item"]);
+            db.failures.deliveryUpdate = true;
+            installDatabase(db);
+
+            await expect(receiveDelivery({
+                id: "delivery-1",
+                supplier: "Updated Supplier",
+                invoiceNo: "INV-NEW",
+                date: "2026-09-28",
+                receivedBy: "Tester",
+                status: "approved",
+                items: [deliveryItem],
+            })).rejects.toThrow("Delivery update failed");
+
+            expect(db.state.deliveryStatuses["delivery-1"]).toBe("draft");
+            expect(db.state.deliveryHeaders["delivery-1"]).toMatchObject({
+                supplier: "Original Supplier",
+                invoiceNo: "INV-OLD",
+                date: "2026-09-27",
+                receivedBy: "Original Recipient",
+            });
+            expect(db.state.deliveryItems).toEqual([["prior-delivery-item"]]);
+            expect(db.state.inventory).toEqual([existingStock]);
+            expect(db.state.activities).toEqual([]);
+            expect(db.execute).toHaveBeenCalledWith("ROLLBACK");
+        });
+
         it("rolls back Delivery and Activity when Inventory stock-in fails", async () => {
             const db = makeDatabase();
+            installExistingProduct(db);
             db.failures.inventoryInsert = true;
             installDatabase(db);
 
@@ -1299,6 +1660,7 @@ describe("Stage 1 behavior characterization", () => {
 
         it("rolls back Delivery, items, and stock if Activity insertion fails", async () => {
             const db = makeDatabase();
+            installExistingProduct(db);
             db.failures.activityInsert = true;
             installDatabase(db);
 
@@ -1326,10 +1688,11 @@ describe("Stage 1 behavior characterization", () => {
                 quantity: 4,
                 batchNumber: deliveryItem.batchNumber,
                 expiryDate: deliveryItem.expiryDate,
-                costPrice: deliveryItem.costPrice,
-                sellingPrice: deliveryItem.sellingPrice,
+                costPrice: 321,
+                sellingPrice: 654,
             });
             const db = makeDatabase([existingStock]);
+            installExistingProduct(db);
             installDatabase(db);
 
             await receiveDelivery({
@@ -1350,8 +1713,8 @@ describe("Stage 1 behavior characterization", () => {
                 quantity: 6,
                 batchNumber: deliveryItem.batchNumber,
                 expiryDate: deliveryItem.expiryDate,
-                costPrice: deliveryItem.costPrice,
-                sellingPrice: deliveryItem.sellingPrice,
+                costPrice: 321,
+                sellingPrice: 654,
             })]);
         });
 
