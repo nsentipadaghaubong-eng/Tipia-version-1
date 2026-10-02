@@ -25,6 +25,97 @@ type SaleDraftItem = SaleItem & {
     productName: string;
     variantLabel: string;
     packagingUnitName: string;
+    selectedStockSelection?: Array<{
+        stockRowId: string;
+        quantity: number;
+        batchNumber: string | null;
+        expiryDate: string | null;
+        stockPackagingUnitId?: string;
+        sellingPrice?: number;
+        recommended?: boolean;
+    }>;
+};
+
+type SaleStockSelectionOption = {
+    stockRowId?: string;
+    batchNumber: string | null;
+    expiryDate: string | null;
+    quantity: number;
+    stockPackagingUnitId?: string;
+    sellingPrice?: number;
+    stockQuantity?: number;
+    quantityStep?: number;
+    recommended?: boolean;
+};
+
+export const selectSaleStockOption = (stockRowId: string, quantity: number) => ({
+    selectedStockRowIds: [stockRowId],
+    selectedStockQuantities: { [stockRowId]: quantity },
+});
+
+export const SaleStockOptionButton = ({
+    allocation,
+    selected,
+    onSelect,
+}: {
+    allocation: SaleStockSelectionOption;
+    selected: boolean;
+    onSelect: () => void;
+}) => (
+    <button
+        type="button"
+        aria-pressed={selected}
+        aria-label={`Select batch ${allocation.batchNumber || "not recorded"}`}
+        onClick={onSelect}
+    >
+        <strong>{allocation.batchNumber || "Batch not recorded"}</strong>
+        {allocation.expiryDate ? ` — ${formatExpiryStatus(allocation.expiryDate)}` : " — No expiry recorded"}
+        {allocation.recommended ? " — FEFO Recommended" : ""}
+        {selected ? " — Selected" : ""}
+    </button>
+);
+
+export const buildSelectedStockAllocationForItem = (
+    item: Pick<SaleItem, "productId" | "variantId" | "packagingUnitId" | "quantity"> & Partial<Pick<SaleItem, "id">>,
+    options: SaleStockSelectionOption[],
+    selectedQuantities: Record<string, number>
+) => {
+    const selected = Object.entries(selectedQuantities)
+        .filter(([, selectedQuantity]) => selectedQuantity > 0)
+        .map(([stockRowId, selectedQuantity]) => {
+        const option = options.find((candidate) => candidate.stockRowId === stockRowId);
+        const quantityStep = option?.quantityStep ?? 1;
+        if (!option || !Number.isInteger(selectedQuantity) || selectedQuantity > option.quantity || selectedQuantity % quantityStep !== 0) {
+            throw new Error("Selected stock allocation is invalid");
+        }
+
+        return { option, quantity: selectedQuantity };
+    });
+
+    const totalSelectedQuantity = selected.reduce((total, entry) => total + entry.quantity, 0);
+    if (selected.length === 0 || totalSelectedQuantity !== item.quantity) {
+        throw new Error("Selected stock allocation is invalid");
+    }
+
+    return {
+        items: [{
+            ...(item.id ? { saleItemId: item.id } : {}),
+            productId: item.productId,
+            variantId: item.variantId,
+            packagingUnitId: item.packagingUnitId,
+            quantity: item.quantity,
+            allocations: selected.map(({ option, quantity }) => ({
+                stockRowId: option.stockRowId ?? "",
+                quantity,
+                batchNumber: option.batchNumber ?? null,
+                expiryDate: option.expiryDate ?? null,
+                stockPackagingUnitId: option.stockPackagingUnitId,
+                ...(option.stockPackagingUnitId === item.packagingUnitId && option.sellingPrice !== undefined
+                    ? { sellingPrice: option.sellingPrice }
+                    : {}),
+            })),
+        }],
+    };
 };
 
 type SaleHeader = { date: string; soldBy: string; notes: string; discount: number };
@@ -67,6 +158,7 @@ const SalesPage = () => {
     const [sales, setSales] = useState<Sale[]>([]);
     const [productSearch, setProductSearch] = useState("");
     const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
+    const [isItemEntryOpen, setIsItemEntryOpen] = useState(false);
     const [selectedVariantId, setSelectedVariantId] = useState("");
     const [selectedPackagingUnitId, setSelectedPackagingUnitId] = useState("");
     const [quantity, setQuantity] = useState(1);
@@ -85,6 +177,8 @@ const SalesPage = () => {
     const [isSaving, setIsSaving] = useState(false);
     const [allocationPreview, setAllocationPreview] = useState<SaleStockAllocation[] | null>(null);
     const [allocationError, setAllocationError] = useState("");
+    const [selectedStockRowIds, setSelectedStockRowIds] = useState<string[]>([]);
+    const [selectedStockQuantities, setSelectedStockQuantities] = useState<Record<string, number>>({});
     const [isDraftSaving, setIsDraftSaving] = useState(false);
     const draftSaleIdRef = useRef<string | null>(null);
     const draftWriteQueue = useRef<Promise<void>>(Promise.resolve());
@@ -232,6 +326,7 @@ const SalesPage = () => {
         if (!selectedProduct || !activeVariant || !selectedPackagingUnit) {
             setAllocationPreview(null);
             setAllocationError("");
+            setSelectedStockQuantities({});
             return;
         }
 
@@ -270,11 +365,14 @@ const SalesPage = () => {
             ?? variant?.packagingUnits[0];
 
         setSelectedProduct(product);
+        setIsItemEntryOpen(false);
         setSelectedVariantId(variant?.id ?? "");
         setSelectedPackagingUnitId(packagingUnit?.id ?? "");
         setUnitPrice(packagingUnit?.sellingPrice ?? 0);
         setQuantity(1);
         setEditingSaleItemId(null);
+        setSelectedStockRowIds([]);
+        setSelectedStockQuantities({});
         setProductSearch("");
         setError(product.variants.length === 0 || !variant || variant.packagingUnits.length === 0
             ? "This product has no packaging units configured for sale."
@@ -290,6 +388,8 @@ const SalesPage = () => {
         setSelectedVariantId(variantId);
         setSelectedPackagingUnitId(packagingUnit?.id ?? "");
         setUnitPrice(packagingUnit?.sellingPrice ?? 0);
+        setSelectedStockRowIds([]);
+        setSelectedStockQuantities({});
     };
 
     const editSaleItem = (item: SaleDraftItem) => {
@@ -302,11 +402,16 @@ const SalesPage = () => {
         }
 
         setSelectedProduct(product);
+        setIsItemEntryOpen(true);
         setSelectedVariantId(variant.id);
         setSelectedPackagingUnitId(packagingUnit.id);
         setQuantity(item.quantity);
         setUnitPrice(item.unitPrice);
         setEditingSaleItemId(item.id);
+        setSelectedStockRowIds(item.selectedStockSelection?.map((entry) => entry.stockRowId) ?? []);
+        setSelectedStockQuantities(Object.fromEntries(
+            (item.selectedStockSelection ?? []).map((entry) => [entry.stockRowId, entry.quantity])
+        ));
         setProductSearch("");
         setError("");
         setMessage("");
@@ -315,7 +420,34 @@ const SalesPage = () => {
     const selectPackagingUnit = (unitId: string) => {
         const unit = packagingUnits.find((entry) => entry.id === unitId);
         setSelectedPackagingUnitId(unitId);
-        setUnitPrice(unit?.sellingPrice ?? 0);
+        if (selectedStockRowIds.length === 0) {
+            setUnitPrice(unit?.sellingPrice ?? 0);
+        }
+        setSelectedStockQuantities(selectedStockRowIds.length === 1
+            ? { [selectedStockRowIds[0]]: quantity }
+            : {});
+    };
+
+    const selectStockOption = (allocation: SaleStockAllocation) => {
+        if (!allocation.stockRowId || !selectedProduct || !activeVariant) return;
+        setSelectedProduct(selectedProduct);
+        setIsItemEntryOpen(true);
+        setSelectedVariantId(activeVariant.id);
+        setSelectedStockRowIds([allocation.stockRowId]);
+        setSelectedStockQuantities(selectSaleStockOption(allocation.stockRowId, quantity).selectedStockQuantities);
+        setUnitPrice(allocation.sellingPrice);
+        setError("");
+        setMessage("");
+    };
+
+    const selectedStockOptions = allocationPreview?.filter((option) =>
+        option.stockRowId && (selectedStockQuantities[option.stockRowId] ?? 0) > 0
+    ) ?? [];
+    const updateSaleQuantity = (nextQuantity: number) => {
+        setQuantity(nextQuantity);
+        if (selectedStockRowIds.length === 1) {
+            setSelectedStockQuantities({ [selectedStockRowIds[0]]: nextQuantity });
+        }
     };
 
     const addToSale = async () => {
@@ -332,6 +464,28 @@ const SalesPage = () => {
         }
         if (!Number.isFinite(unitPrice) || unitPrice < 0) {
             setError("Unit price cannot be negative");
+            return;
+        }
+
+        if (!allocationPreview || allocationPreview.length === 0) {
+            setError("No stock is available for this item selection.");
+            return;
+        }
+
+        try {
+            buildSelectedStockAllocationForItem(
+                {
+                    id: editingSaleItemId ?? "pending-sale-item",
+                    productId: selectedProduct.id,
+                    variantId: activeVariant.id,
+                    packagingUnitId: selectedPackagingUnit.id,
+                    quantity,
+                },
+                allocationPreview,
+                selectedStockQuantities
+            );
+        } catch (selectionError) {
+            setError(selectionError instanceof Error ? selectionError.message : "Selected stock allocation is invalid");
             return;
         }
 
@@ -358,6 +512,26 @@ const SalesPage = () => {
         }
 
         const saleId = draftSaleIdRef.current ?? crypto.randomUUID();
+        const selectedStockSelection = buildSelectedStockAllocationForItem(
+            {
+                id: editingSaleItemId ?? crypto.randomUUID(),
+                productId: selectedProduct.id,
+                variantId: activeVariant.id,
+                packagingUnitId: selectedPackagingUnit.id,
+                quantity,
+            },
+            allocationPreview ?? [],
+            selectedStockQuantities
+        ).items[0].allocations.map((allocation) => ({
+            stockRowId: allocation.stockRowId,
+            quantity: allocation.quantity,
+            batchNumber: allocation.batchNumber,
+            expiryDate: allocation.expiryDate,
+            stockPackagingUnitId: allocation.stockPackagingUnitId,
+            sellingPrice: allocation.sellingPrice,
+            recommended: allocationPreview?.find((entry) => entry.stockRowId === allocation.stockRowId)?.recommended ?? false,
+        }));
+
         const nextItem = {
             id: editingSaleItemId ?? crypto.randomUUID(),
             saleId,
@@ -366,6 +540,9 @@ const SalesPage = () => {
             packagingUnitId: selectedPackagingUnit.id,
             quantity,
             unitPrice,
+            batchNumber: selectedStockSelection[0]?.batchNumber ?? undefined,
+            expiryDate: selectedStockSelection[0]?.expiryDate ?? undefined,
+            selectedStockSelection,
             productName: selectedProduct.name,
             variantLabel: formatVariantInfo(activeVariant),
             packagingUnitName: selectedPackagingUnit.name || "Unnamed Unit",
@@ -403,8 +580,11 @@ const SalesPage = () => {
             setSoldBy("");
             setNotes("");
             setSelectedProduct(null);
+            setIsItemEntryOpen(false);
             setSelectedVariantId("");
             setSelectedPackagingUnitId("");
+            setSelectedStockRowIds([]);
+            setSelectedStockQuantities({});
             setProductSearch("");
             setMessage("");
             setError("");
@@ -440,7 +620,35 @@ const SalesPage = () => {
             return;
         }
 
+        if (cart.some((item) => !item.selectedStockSelection || item.selectedStockSelection.length === 0)) {
+            setError("Select stock for every sale item before completing the sale. Edit draft items to choose their batches.");
+            return;
+        }
+
         const saleId = draftSaleIdRef.current ?? crypto.randomUUID();
+        const selectedAllocation = {
+            items: cart
+                .map((item) => {
+                    if (!item.selectedStockSelection || item.selectedStockSelection.length === 0) return null;
+
+                    return {
+                        saleItemId: item.id,
+                        productId: item.productId,
+                        variantId: item.variantId,
+                        packagingUnitId: item.packagingUnitId,
+                        quantity: item.quantity,
+                        allocations: item.selectedStockSelection.map((selection) => ({
+                            stockRowId: selection.stockRowId,
+                            quantity: selection.quantity,
+                            batchNumber: selection.batchNumber ?? "",
+                            expiryDate: selection.expiryDate ?? "",
+                            stockPackagingUnitId: selection.stockPackagingUnitId,
+                            sellingPrice: selection.sellingPrice,
+                        })),
+                    };
+                })
+                .filter((item): item is NonNullable<typeof item> => item !== null),
+        };
         const sale: Sale = {
             id: saleId,
             date: saleDate,
@@ -452,7 +660,11 @@ const SalesPage = () => {
                 ...item,
                 saleId,
             })),
-        };
+        } as Sale & { selectedAllocation?: typeof selectedAllocation };
+
+        if (selectedAllocation.items.length > 0) {
+            (sale as Sale & { selectedAllocation?: typeof selectedAllocation }).selectedAllocation = selectedAllocation;
+        }
 
         setIsSaving(true);
         setError("");
@@ -471,6 +683,8 @@ const SalesPage = () => {
             setSelectedProduct(null);
             setSelectedVariantId("");
             setSelectedPackagingUnitId("");
+            setSelectedStockRowIds([]);
+            setSelectedStockQuantities({});
             setProductSearch("");
             setMessage("Sale completed successfully.");
         } catch (saveError) {
@@ -557,11 +771,20 @@ const SalesPage = () => {
                         ) : (
                             <div>No packaging units configured</div>
                         )}
+                        <h3>Eligible Stock Options</h3>
+                        {allocationError ? <p>{allocationError}</p> : allocationPreview?.length ? allocationPreview.map((allocation, index) => (
+                            <SaleStockOptionButton
+                                key={`${allocation.stockRowId ?? allocation.batchNumber ?? "no-batch"}-${index}`}
+                                allocation={allocation}
+                                selected={Boolean(allocation.stockRowId && selectedStockRowIds.includes(allocation.stockRowId))}
+                                onSelect={() => selectStockOption(allocation)}
+                            />
+                        )) : allocationPreview ? <p>No stock is available for this sale.</p> : <p>Loading stock options...</p>}
                     </div>
                 )}
             </div>
 
-            {selectedProduct && (
+            {selectedProduct && isItemEntryOpen && (
                 <div>
                     <h2>Item Entry</h2>
                     <div>
@@ -583,7 +806,16 @@ const SalesPage = () => {
                         </div>
                         <div>
                             <label htmlFor="sale-quantity">Quantity</label>
-                            <input id="sale-quantity" type="number" min="1" step="1" value={quantity} onChange={(event) => setQuantity(Number(event.target.value))} />
+                            <input
+                                id="sale-quantity"
+                                type="number"
+                                min="1"
+                                step={selectedStockRowIds.length === 1
+                                    ? allocationPreview?.find((entry) => entry.stockRowId === selectedStockRowIds[0])?.quantityStep ?? 1
+                                    : 1}
+                                value={quantity}
+                                onChange={(event) => updateSaleQuantity(Number(event.target.value))}
+                            />
                         </div>
                         <div>
                             <label htmlFor="sale-unit-price">Unit Price</label>
@@ -594,14 +826,15 @@ const SalesPage = () => {
                         <p>This product has no packaging units configured — add one before selling it.</p>
                     ) : (
                         <div>
-                            <h3>FEFO Allocation Preview</h3>
-                            {allocationError ? <p>{allocationError}</p> : allocationPreview?.length ? allocationPreview.map((allocation, index) => (
-                                <p key={`${allocation.batchNumber ?? "no-batch"}-${allocation.expiryDate ?? "no-expiry"}-${index}`}>
-                                    {allocation.batchNumber || "Batch not recorded"}
-                                    {allocation.expiryDate ? ` — ${formatExpiryStatus(allocation.expiryDate)}` : " — No expiry recorded"}
-                                    {` — ${allocation.quantity} ${selectedPackagingUnit?.name ?? ""}`}
+                            <h3>Selected Stock Allocation</h3>
+                            {selectedStockOptions.length > 0 && (
+                                <p>
+                                    Selected stock: {selectedStockOptions.map((option) => [
+                                        option.batchNumber || "Batch not recorded",
+                                        option.expiryDate ? formatExpiryStatus(option.expiryDate) : "No expiry recorded",
+                                    ].join(" — ")).join("; ")}
                                 </p>
-                            )) : allocationPreview ? <p>No stock is available for this sale.</p> : <p>Calculating allocation...</p>}
+                            )}
                             <p>Preview only. Inventory is rechecked when the sale is completed.</p>
                         </div>
                     )}

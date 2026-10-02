@@ -79,6 +79,19 @@ export type Sale = {
     items: SaleItem[];
 };
 
+export type SaleItemAllocation = {
+    id: string;
+    saleItemId: string;
+    sourceInventoryStockId: string;
+    quantity: number;
+    sourcePackagingUnitId: string;
+    sourcePackagingUnitName: string;
+    sourceQuantity: number;
+    batchNumber?: string;
+    expiryDate?: string;
+    sellingPrice: number;
+};
+
 export type SaleItem = {
     id: string;
     saleId: string;
@@ -89,6 +102,7 @@ export type SaleItem = {
     unitPrice: number;
     batchNumber?: string;
     expiryDate?: string;
+    allocations?: SaleItemAllocation[];
 };
 
 export interface PackagingUnit {

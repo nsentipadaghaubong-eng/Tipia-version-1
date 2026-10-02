@@ -28,6 +28,7 @@ export type InventoryStockBatchCandidate = {
     quantity: number;
     batchNumber: string | null;
     expiryDate: string | null;
+    sellingPrice: number;
 };
 
 export type InventoryStockQuantityRow = {
@@ -171,16 +172,18 @@ export const getInventoryStockBatchCandidates = (
     variantId: string,
         packagingUnitId: string,
         batchNumber: string | null,
-        expiryDate: string | null
+        expiryDate: string | null,
+        costPrice: number
 ) => db.select<InventoryStockBatchCandidate[]>(`
-    SELECT id, quantity, batch_number AS batchNumber, expiry_date AS expiryDate
+    SELECT id, quantity, batch_number AS batchNumber, expiry_date AS expiryDate, selling_price AS sellingPrice
     FROM inventory_stock
     WHERE product_id = ?
       AND variant_id = ?
       AND packaging_unit_id = ?
-            AND COALESCE(batch_number, '') = COALESCE(?, '')
-            AND COALESCE(expiry_date, '') = COALESCE(?, '')
-`, [productId, variantId, packagingUnitId, batchNumber, expiryDate]);
+    AND COALESCE(batch_number, '') = COALESCE(?, '')
+    AND COALESCE(expiry_date, '') = COALESCE(?, '')
+    AND cost_price = ?
+`, [productId, variantId, packagingUnitId, batchNumber, expiryDate, costPrice]);
 
 export const getInventoryStockQuantitiesByVariant = async (
     db: SqliteDatabase,

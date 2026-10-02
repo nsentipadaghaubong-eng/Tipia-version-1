@@ -7,6 +7,7 @@ vi.mock("@tauri-apps/plugin-sql", () => ({
 }));
 
 import Database from "@tauri-apps/plugin-sql";
+import salesPageSource from "../pages/SalesPage.tsx?raw";
 import {
     convertQuantityToSmallest,
     adjustInventory,
@@ -23,7 +24,9 @@ import {
 } from "./database";
 import { receiveDelivery, saveDeliveryDraft } from "./deliveryWorkflow";
 import { addInventoryStock, setInventoryStockEntry } from "./inventory";
+import * as inventoryMutations from "./inventory";
 import * as activityRepository from "./activityRepository";
+import { mapSaleItems, type SaleItemRow } from "./salesRepository";
 import type { Delivery, DeliveryItems, PackagingUnit, Product, Sale } from "../types/Product";
 import type { ActivityRecord } from "../types/Activity";
 import type { InventoryAdjustmentInput, InventoryStockValues } from "../types/Inventory";
@@ -61,6 +64,7 @@ type TestState = {
     sales: string[];
     saleStatuses: Record<string, string>;
     saleItems: unknown[][];
+    saleItemAllocations: unknown[][];
 };
 
 type TestDatabase = {
@@ -75,6 +79,7 @@ type TestDatabase = {
         inventoryInsert: boolean;
         deliveryItemInsert: boolean;
         deliveryUpdate: boolean;
+        saleItemAllocationInsert: boolean;
     };
 };
 
@@ -143,6 +148,34 @@ const saleFor = (quantity: number, packagingUnitId = "card"): Sale => ({
     }],
 });
 
+type SelectedTestAllocation = {
+    stockRowId: string;
+    quantity: number;
+    batchNumber?: string | null;
+    expiryDate?: string | null;
+    stockPackagingUnitId?: string;
+};
+
+const withSelectedAllocations = (
+    sale: Sale,
+    allocationsByItem: SelectedTestAllocation[][]
+) => ({
+    ...sale,
+    selectedAllocation: {
+        items: sale.items.map((item, index) => ({
+            saleItemId: item.id,
+            productId: item.productId,
+            variantId: item.variantId,
+            packagingUnitId: item.packagingUnitId,
+            quantity: item.quantity,
+            allocations: (allocationsByItem[index] ?? []).map((allocation) => ({
+                ...allocation,
+                sellingPrice: sale.items[index].unitPrice,
+            })),
+        })),
+    },
+});
+
 const makeStockRow = (overrides: Partial<StockRow> = {}): StockRow => ({
     id: "stock-sachet-1",
     productId: "product-1",
@@ -152,7 +185,7 @@ const makeStockRow = (overrides: Partial<StockRow> = {}): StockRow => ({
     batchNumber: "batch-sachet",
     expiryDate: "2027-01-01",
     costPrice: 50,
-    sellingPrice: 70,
+    sellingPrice: overrides.packagingUnitId === "card" ? 7 : 70,
     ...overrides,
 });
 
@@ -174,6 +207,7 @@ const makeDatabase = (initialInventory: StockRow[] = []): TestDatabase => {
         sales: [],
         saleStatuses: {},
         saleItems: [],
+        saleItemAllocations: [],
     };
     const failures = {
         activityInsert: false,
@@ -183,6 +217,7 @@ const makeDatabase = (initialInventory: StockRow[] = []): TestDatabase => {
         inventoryInsert: false,
         deliveryItemInsert: false,
         deliveryUpdate: false,
+        saleItemAllocationInsert: false,
     };
     let inventoryUpdateCalls = 0;
     let transactionSnapshot: TestState | null = null;
@@ -212,16 +247,17 @@ const makeDatabase = (initialInventory: StockRow[] = []): TestDatabase => {
                     .map(({ id }) => ({ id }));
             }
             if (sql.includes("WHERE product_id = ?") && sql.includes("packaging_unit_id = ?")) {
-                const [productId, variantId, unitId, batch, expiry] = bindings;
+                const [productId, variantId, unitId, batch, expiry, costPrice] = bindings;
                 const matches = state.inventory.filter((row) =>
                     row.productId === productId &&
                     row.variantId === variantId &&
                     row.packagingUnitId === unitId &&
                     (row.batchNumber ?? "") === (batch ?? "") &&
-                    (row.expiryDate ?? "") === (expiry ?? "")
+                    (row.expiryDate ?? "") === (expiry ?? "") &&
+                    (!sql.includes("AND cost_price = ?") || row.costPrice === Number(costPrice))
                 );
                 return sql.includes("quantity")
-                    ? matches.map(({ id, quantity }) => ({ id, quantity }))
+                    ? matches.map(({ id, quantity, sellingPrice }) => ({ id, quantity, sellingPrice }))
                     : matches.map(({ id }) => ({ id }));
             }
             const rows = state.inventory.filter((row) =>
@@ -427,10 +463,14 @@ const makeDatabase = (initialInventory: StockRow[] = []): TestDatabase => {
         } else if (sql.includes("UPDATE sales")) {
             const saleId = String(bindings[6]);
             state.saleStatuses[saleId] = String(bindings[5]);
+        } else if (sql.includes("INSERT INTO sale_item_allocations")) {
+            if (failures.saleItemAllocationInsert) throw new Error("Sale item allocation insert failed");
+            state.saleItemAllocations.push(bindings);
         } else if (sql.includes("INSERT INTO sale_items")) {
             state.saleItems.push(bindings);
         } else if (sql.includes("DELETE FROM sale_items")) {
             state.saleItems = [];
+            state.saleItemAllocations = [];
         }
         return { rowsAffected: 1 };
     });
@@ -1061,10 +1101,75 @@ describe("Stage 1 behavior characterization", () => {
             const db = makeDatabase([makeStockRow({ quantity: 4 })]);
             installExistingProduct(db);
 
-            await addInventoryStock(db as never, { ...deliveryItem, packagingUnitId: "sachet", quantity: 3, batchNumber: "batch-sachet", expiryDate: "2027-01-01" });
+            await addInventoryStock(db as never, { ...deliveryItem, packagingUnitId: "sachet", quantity: 3, batchNumber: "batch-sachet", expiryDate: "2027-01-01", costPrice: 50, sellingPrice: 70 });
 
             expect(db.state.inventory).toHaveLength(1);
             expect(db.state.inventory[0]).toMatchObject({ packagingUnitId: "sachet", quantity: 7 });
+        });
+
+        it("merges matching stock positions when acquisition cost is the same", async () => {
+            const existingStock = makeStockRow({
+                id: "stock-pack-cost-5000",
+                packagingUnitId: "pack",
+                quantity: 10,
+                batchNumber: "batch-1",
+                expiryDate: "2030-01-01",
+                costPrice: 5000,
+                sellingPrice: 7000,
+            });
+            const db = makeDatabase([existingStock]);
+            installExistingProduct(db);
+
+            await addInventoryStock(db as never, {
+                ...deliveryItem,
+                quantity: 5,
+                costPrice: 5000,
+                sellingPrice: 7000,
+            });
+
+            expect(db.state.inventory).toEqual([expect.objectContaining({
+                id: "stock-pack-cost-5000",
+                quantity: 15,
+                costPrice: 5000,
+                sellingPrice: 7000,
+            })]);
+        });
+
+        it("keeps matching stock positions with different acquisition costs separate", async () => {
+            const existingStock = makeStockRow({
+                id: "stock-pack-cost-5000",
+                packagingUnitId: "pack",
+                quantity: 10,
+                batchNumber: "batch-1",
+                expiryDate: "2030-01-01",
+                costPrice: 5000,
+                sellingPrice: 7000,
+            });
+            const db = makeDatabase([existingStock]);
+            installExistingProduct(db);
+
+            await addInventoryStock(db as never, {
+                ...deliveryItem,
+                quantity: 5,
+                costPrice: 5500,
+                sellingPrice: 7000,
+            });
+
+            expect(db.state.inventory).toHaveLength(2);
+            expect(db.state.inventory).toEqual(expect.arrayContaining([
+                expect.objectContaining({
+                    id: "stock-pack-cost-5000",
+                    quantity: 10,
+                    costPrice: 5000,
+                    sellingPrice: 7000,
+                }),
+                expect.objectContaining({
+                    id: expect.not.stringMatching(/^stock-pack-cost-5000$/),
+                    quantity: 5,
+                    costPrice: 5500,
+                    sellingPrice: 7000,
+                }),
+            ]));
         });
 
         it("Inventory stores a fractional quantity unchanged in the submitted unit", async () => {
@@ -1558,6 +1663,8 @@ describe("Stage 1 behavior characterization", () => {
                 quantity: 4,
                 batchNumber: deliveryItem.batchNumber,
                 expiryDate: deliveryItem.expiryDate,
+                costPrice: deliveryItem.costPrice,
+                sellingPrice: deliveryItem.sellingPrice,
             });
             const db = makeDatabase([existingStock]);
             installExistingProduct(db);
@@ -1688,8 +1795,8 @@ describe("Stage 1 behavior characterization", () => {
                 quantity: 4,
                 batchNumber: deliveryItem.batchNumber,
                 expiryDate: deliveryItem.expiryDate,
-                costPrice: 321,
-                sellingPrice: 654,
+                costPrice: deliveryItem.costPrice,
+                sellingPrice: deliveryItem.sellingPrice,
             });
             const db = makeDatabase([existingStock]);
             installExistingProduct(db);
@@ -1713,9 +1820,40 @@ describe("Stage 1 behavior characterization", () => {
                 quantity: 6,
                 batchNumber: deliveryItem.batchNumber,
                 expiryDate: deliveryItem.expiryDate,
-                costPrice: 321,
-                sellingPrice: 654,
+                costPrice: deliveryItem.costPrice,
+                sellingPrice: deliveryItem.sellingPrice,
             })]);
+        });
+
+        it("rejects a matching batch receipt with a different selling price and rolls back", async () => {
+            const existingStock = makeStockRow({
+                id: "stock-existing",
+                packagingUnitId: deliveryItem.packagingUnitId,
+                quantity: 4,
+                batchNumber: deliveryItem.batchNumber,
+                expiryDate: deliveryItem.expiryDate,
+                costPrice: deliveryItem.costPrice,
+                sellingPrice: deliveryItem.sellingPrice,
+            });
+            const db = makeDatabase([existingStock]);
+            installExistingProduct(db);
+            installDatabase(db);
+
+            await expect(receiveDelivery({
+                id: "delivery-conflicting-price",
+                supplier: "Supplier",
+                invoiceNo: "INV-CONFLICT",
+                date: "2026-09-28",
+                receivedBy: "Tester",
+                status: "approved",
+                items: [{ ...deliveryItem, sellingPrice: deliveryItem.sellingPrice + 100 }],
+            })).rejects.toThrow("Conflicting selling price");
+
+            expect(db.state.inventory).toEqual([existingStock]);
+            expect(db.state.deliveries).toEqual([]);
+            expect(db.state.deliveryItems).toEqual([]);
+            expect(db.state.activities).toEqual([]);
+            expect(db.execute).toHaveBeenCalledWith("ROLLBACK");
         });
 
         it("failed delivery approval rolls back delivery and inventory state", async () => {
@@ -1772,7 +1910,209 @@ describe("Stage 1 behavior characterization", () => {
                 .rejects.toThrow("without splitting stock incorrectly");
         });
 
-        it("returns the earliest-expiring eligible batch first", async () => {
+        it("returns each selected stock row's selling price in its Sales option", async () => {
+            const db = makeDatabase([
+                makeStockRow({ id: "stock-b1", packagingUnitId: "pack", batchNumber: "B1", sellingPrice: 7000 }),
+                makeStockRow({ id: "stock-b3", packagingUnitId: "pack", batchNumber: "B3", sellingPrice: 7500 }),
+            ]);
+            installDatabase(db);
+
+            const options = await getSaleStockAllocationPreview("product-1", "variant-1", "pack", 1);
+
+            expect(options.find((option) => option.batchNumber === "B1")?.sellingPrice).toBe(7000);
+            expect(options.find((option) => option.batchNumber === "B3")?.sellingPrice).toBe(7500);
+        });
+
+        it("completes an unchanged same-level price and persists it as historical Sale and Activity price", async () => {
+            const stock = makeStockRow({
+                id: "stock-b3",
+                packagingUnitId: "pack",
+                quantity: 2,
+                batchNumber: "B3",
+                sellingPrice: 7500,
+            });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const sale = saleFor(2, "pack");
+            sale.items[0].unitPrice = 7500;
+            sale.totalAmount = 15000;
+
+            await createSale(withSelectedAllocations(sale, [[{ stockRowId: "stock-b3", quantity: 2 }]]) as Sale);
+
+            expect(db.state.saleItems[0]).toEqual([
+                expect.any(String), "sale-1", "product-1", "variant-1", "pack", 2, 7500, "B3", "2027-01-01",
+            ]);
+            expect(db.state.activities[0].details).toMatchObject({
+                items: [{ unitPrice: 7500, lineAmount: 15000 }],
+            });
+        });
+
+        it("allows an edited Sales price when the selected Inventory price differs", async () => {
+            const stock = makeStockRow({
+                id: "stock-b3",
+                packagingUnitId: "pack",
+                quantity: 2,
+                batchNumber: "B3",
+                sellingPrice: 7500,
+            });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const sale = saleFor(1, "pack");
+            sale.items[0].unitPrice = 7000;
+            sale.totalAmount = 7000;
+
+            await createSale(withSelectedAllocations(sale, [[{ stockRowId: "stock-b3", quantity: 1 }]]) as Sale);
+
+            expect(db.state.inventory).toEqual([expect.objectContaining({ id: "stock-b3", quantity: 1 })]);
+            expect(db.state.saleItems[0][6]).toBe(7000);
+            expect(db.state.activities[0].details).toMatchObject({
+                items: [{ unitPrice: 7000, lineAmount: 7000 }],
+            });
+        });
+
+        it("persists the final Sales Unit Price rather than replacing it with Inventory price", async () => {
+            const stock = makeStockRow({
+                id: "stock-b3",
+                packagingUnitId: "pack",
+                quantity: 2,
+                batchNumber: "B3",
+                sellingPrice: 7500,
+            });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const sale = saleFor(1, "pack");
+            sale.items[0].unitPrice = 7000;
+            sale.totalAmount = 7000;
+            const selectedSale = withSelectedAllocations(sale, [[{ stockRowId: "stock-b3", quantity: 1 }]]);
+            selectedSale.selectedAllocation.items[0].allocations[0].sellingPrice = 7500;
+
+            await createSale(selectedSale as Sale);
+
+            expect(db.state.inventory).toEqual([expect.objectContaining({ id: "stock-b3", quantity: 1 })]);
+            expect(db.state.saleItems[0][6]).toBe(7000);
+            expect(db.state.activities[0].details).toMatchObject({
+                items: [{ unitPrice: 7000, lineAmount: 7000 }],
+            });
+        });
+
+        it.each([
+            ["unchanged batch and expiry", {}],
+            ["changed sellingPrice only", { sellingPrice: 7100 }],
+        ])("accepts selected stock with %s", async (_description, rowChanges) => {
+            const stock = makeStockRow({
+                id: "stock-selected",
+                packagingUnitId: "pack",
+                quantity: 2,
+                batchNumber: "B1",
+                expiryDate: "2027-01-01",
+                ...rowChanges,
+            });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const sale = saleFor(1, "pack");
+            const selectedSale = withSelectedAllocations(sale, [[{
+                stockRowId: "stock-selected",
+                quantity: 1,
+                batchNumber: "B1",
+                expiryDate: "2027-01-01",
+            }]]);
+
+            await createSale(selectedSale as Sale);
+
+            expect(db.state.inventory).toEqual([expect.objectContaining({ id: "stock-selected", quantity: 1 })]);
+            expect(db.state.saleItems).toHaveLength(1);
+        });
+
+        it("rejects a selected row whose batch changed before completion", async () => {
+            const stock = makeStockRow({
+                id: "stock-selected",
+                packagingUnitId: "pack",
+                quantity: 2,
+                batchNumber: "B1",
+                expiryDate: "2027-01-01",
+            });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const selectedSale = withSelectedAllocations(saleFor(1, "pack"), [[{
+                stockRowId: "stock-selected",
+                quantity: 1,
+                batchNumber: "B1",
+                expiryDate: "2027-01-01",
+            }]]);
+            db.state.inventory[0].batchNumber = "B2";
+            const changedStock = structuredClone(db.state.inventory);
+
+            await expect(createSale(selectedSale as Sale)).rejects.toThrow("Selected stock allocation is invalid");
+
+            expect(db.state.inventory).toEqual(changedStock);
+            expect(db.state.sales).toEqual([]);
+            expect(db.state.saleItems).toEqual([]);
+            expect(db.state.activities).toEqual([]);
+        });
+
+        it("rejects a selected row whose expiry changed before completion", async () => {
+            const stock = makeStockRow({
+                id: "stock-selected",
+                packagingUnitId: "pack",
+                quantity: 2,
+                batchNumber: "B1",
+                expiryDate: "2027-01-01",
+            });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const selectedSale = withSelectedAllocations(saleFor(1, "pack"), [[{
+                stockRowId: "stock-selected",
+                quantity: 1,
+                batchNumber: "B1",
+                expiryDate: "2027-01-01",
+            }]]);
+            db.state.inventory[0].expiryDate = "2028-01-01";
+            const changedStock = structuredClone(db.state.inventory);
+
+            await expect(createSale(selectedSale as Sale)).rejects.toThrow("Selected stock allocation is invalid");
+
+            expect(db.state.inventory).toEqual(changedStock);
+            expect(db.state.sales).toEqual([]);
+            expect(db.state.saleItems).toEqual([]);
+            expect(db.state.activities).toEqual([]);
+        });
+
+        it("rejects a selected row whose packaging unit changed before completion", async () => {
+            const stock = makeStockRow({
+                id: "stock-selected",
+                packagingUnitId: "pack",
+                quantity: 2,
+                batchNumber: "B1",
+                expiryDate: "2027-01-01",
+            });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const selectedSale = withSelectedAllocations(saleFor(1, "pack"), [[{
+                stockRowId: "stock-selected",
+                quantity: 1,
+                batchNumber: "B1",
+                expiryDate: "2027-01-01",
+                stockPackagingUnitId: "pack",
+            }]]);
+            db.state.inventory[0].packagingUnitId = "sachet";
+            const changedStock = structuredClone(db.state.inventory);
+
+            await expect(createSale(selectedSale as Sale)).rejects.toThrow("Selected stock allocation is invalid");
+
+            expect(db.state.inventory).toEqual(changedStock);
+            expect(db.state.sales).toEqual([]);
+            expect(db.state.saleItems).toEqual([]);
+            expect(db.state.activities).toEqual([]);
+        });
+
+        it("returns all eligible batches while identifying the FEFO recommendation", async () => {
             const db = makeDatabase([
                 makeStockRow({ id: "later", packagingUnitId: "card", quantity: 1, batchNumber: "later", expiryDate: "2028-01-01" }),
                 makeStockRow({ id: "sooner", packagingUnitId: "card", quantity: 1, batchNumber: "sooner", expiryDate: "2027-01-01" }),
@@ -1780,7 +2120,521 @@ describe("Stage 1 behavior characterization", () => {
             installDatabase(db);
 
             await expect(getSaleStockAllocationPreview("product-1", "variant-1", "card", 1))
-                .resolves.toEqual([{ batchNumber: "sooner", expiryDate: "2027-01-01", quantity: 1 }]);
+                .resolves.toEqual([
+                    expect.objectContaining({ batchNumber: "sooner", expiryDate: "2027-01-01", quantity: 1, stockQuantity: 1, stockPackagingUnitId: "card", quantityStep: 1, recommended: true }),
+                    expect.objectContaining({ batchNumber: "later", expiryDate: "2028-01-01", quantity: 1, stockQuantity: 1, stockPackagingUnitId: "card", quantityStep: 1, recommended: false }),
+                ]);
+        });
+
+        it("returns the complete FEFO plan while preserving recommendation ordering", async () => {
+            const db = makeDatabase([
+                makeStockRow({ id: "stock-later", packagingUnitId: "card", quantity: 20, batchNumber: "batch-later", expiryDate: "2029-01-01" }),
+                makeStockRow({ id: "stock-mid", packagingUnitId: "card", quantity: 15, batchNumber: "batch-mid", expiryDate: "2028-01-01" }),
+                makeStockRow({ id: "stock-earlier", packagingUnitId: "card", quantity: 10, batchNumber: "batch-earlier", expiryDate: "2027-01-01" }),
+            ]);
+            installExistingProduct(db);
+            installDatabase(db);
+
+            const preview = await getSaleStockAllocationPreview("product-1", "variant-1", "card", 12);
+
+            expect(preview.map((entry) => entry.batchNumber)).toEqual(expect.arrayContaining([
+                "batch-earlier",
+                "batch-mid",
+                "batch-later",
+            ]));
+            expect(preview.find((entry) => entry.batchNumber === "batch-earlier")).toMatchObject({
+                recommended: true,
+                plannedQuantity: 10,
+            });
+            expect(preview.find((entry) => entry.batchNumber === "batch-mid")).toMatchObject({
+                recommended: false,
+                plannedQuantity: 2,
+            });
+            expect(preview.find((entry) => entry.batchNumber === "batch-later")).toMatchObject({
+                recommended: false,
+                plannedQuantity: 0,
+            });
+        });
+
+        it("fulfills an unpinned sale across FEFO positions and stops once the request is covered", async () => {
+            const unusedStock = makeStockRow({
+                id: "stock-unused",
+                packagingUnitId: "card",
+                quantity: 9,
+                batchNumber: "batch-unused",
+                expiryDate: "2029-01-01",
+            });
+            const secondStock = makeStockRow({
+                id: "stock-second",
+                packagingUnitId: "card",
+                quantity: 5,
+                batchNumber: "batch-second",
+                expiryDate: "2028-01-01",
+            });
+            const firstStock = makeStockRow({
+                id: "stock-first",
+                packagingUnitId: "card",
+                quantity: 10,
+                batchNumber: "batch-first",
+                expiryDate: "2027-01-01",
+            });
+            const db = makeDatabase([unusedStock, secondStock, firstStock]);
+            installExistingProduct(db);
+            installDatabase(db);
+
+            const preview = await getSaleStockAllocationPreview("product-1", "variant-1", "card", 15);
+            await createSale(saleFor(15));
+
+            expect(preview.map(({ batchNumber, plannedQuantity }) => [batchNumber, plannedQuantity])).toEqual([
+                ["batch-first", 10],
+                ["batch-second", 5],
+                ["batch-unused", 0],
+            ]);
+            expect(db.state.inventory).toEqual([expect.objectContaining({ id: "stock-unused", quantity: 9 })]);
+            expect(db.state.saleItems).toEqual([
+                ["sale-item-1", "sale-1", "product-1", "variant-1", "card", 15, 7, null, null],
+            ]);
+            expect(db.state.saleItemAllocations).toEqual([
+                [expect.any(String), "sale-item-1", "stock-first", 10, "card", "Card", 10, "batch-first", "2027-01-01", 7],
+                [expect.any(String), "sale-item-1", "stock-second", 5, "card", "Card", 5, "batch-second", "2028-01-01", 7],
+            ]);
+            expect(db.state.saleItemAllocations.reduce((total, allocation) => total + Number(allocation[3]), 0)).toBe(15);
+            expect(db.state.activities[0].details).toMatchObject({
+                items: [{
+                    quantity: 15,
+                    allocations: [
+                        { quantity: 10, batchNumber: "batch-first", expiryDate: "2027-01-01" },
+                        { quantity: 5, batchNumber: "batch-second", expiryDate: "2028-01-01" },
+                    ],
+                }],
+            });
+        });
+
+        it("stores each physical allocation selling price independently", async () => {
+            const firstStock = makeStockRow({
+                id: "stock-price-7000",
+                packagingUnitId: "pack",
+                quantity: 10,
+                batchNumber: "batch-price-7000",
+                expiryDate: "2027-01-01",
+                sellingPrice: 7000,
+            });
+            const secondStock = makeStockRow({
+                id: "stock-price-7500",
+                packagingUnitId: "pack",
+                quantity: 5,
+                batchNumber: "batch-price-7500",
+                expiryDate: "2028-01-01",
+                sellingPrice: 7500,
+            });
+            const db = makeDatabase([firstStock, secondStock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const sale = saleFor(15, "pack");
+            sale.items[0].unitPrice = 6800;
+
+            await createSale(sale);
+
+            expect(db.state.saleItems).toEqual([
+                ["sale-item-1", "sale-1", "product-1", "variant-1", "pack", 15, 6800, null, null],
+            ]);
+            expect(db.state.saleItemAllocations.map((allocation) => [allocation[2], allocation[3], allocation[9]])).toEqual([
+                ["stock-price-7000", 10, 7000],
+                ["stock-price-7500", 5, 7500],
+            ]);
+        });
+
+        it("groups multiple physical allocations under each logical sale line", async () => {
+            const stock = [
+                makeStockRow({ id: "stock-line-1", packagingUnitId: "card", quantity: 2, batchNumber: "batch-1", expiryDate: "2027-01-01" }),
+                makeStockRow({ id: "stock-line-2", packagingUnitId: "card", quantity: 2, batchNumber: "batch-2", expiryDate: "2028-01-01" }),
+                makeStockRow({ id: "stock-line-3", packagingUnitId: "card", quantity: 2, batchNumber: "batch-3", expiryDate: "2029-01-01" }),
+            ];
+            const db = makeDatabase(stock);
+            installExistingProduct(db);
+            installDatabase(db);
+            const sale = saleFor(3);
+            sale.items.push({ ...sale.items[0], id: "sale-item-2", quantity: 3 });
+            sale.totalAmount = 42;
+
+            await createSale(sale);
+
+            expect(db.state.saleItems.map((item) => [item[0], item[5]])).toEqual([
+                ["sale-item-1", 3],
+                ["sale-item-2", 3],
+            ]);
+            expect(db.state.saleItemAllocations.map((allocation) => [allocation[1], allocation[2], allocation[3]])).toEqual([
+                ["sale-item-1", "stock-line-1", 2],
+                ["sale-item-1", "stock-line-2", 1],
+                ["sale-item-2", "stock-line-2", 1],
+                ["sale-item-2", "stock-line-3", 2],
+            ]);
+            const quantitiesBySaleItemId = db.state.saleItemAllocations.reduce<Record<string, number>>((totals, allocation) => {
+                const saleItemId = String(allocation[1]);
+                totals[saleItemId] = (totals[saleItemId] ?? 0) + Number(allocation[3]);
+                return totals;
+            }, {});
+            expect(quantitiesBySaleItemId).toEqual({ "sale-item-1": 3, "sale-item-2": 3 });
+        });
+
+        it("keeps existing completed sale item rows readable without inventing allocation groups", () => {
+            const legacyItem: SaleItemRow = {
+                id: "legacy-sale-item",
+                saleId: "legacy-sale",
+                productId: "product-1",
+                variantId: "variant-1",
+                packagingUnitId: "card",
+                quantity: 2,
+                unitPrice: 7,
+                batchNumber: "legacy-batch",
+                expiryDate: "2026-01-01",
+            };
+
+            expect(mapSaleItems([legacyItem])).toEqual([legacyItem]);
+        });
+
+        it("rejects insufficient unpinned FEFO fulfillment before inventory mutation", async () => {
+            const firstStock = makeStockRow({
+                id: "stock-first",
+                packagingUnitId: "card",
+                quantity: 2,
+                batchNumber: "batch-first",
+                expiryDate: "2027-01-01",
+            });
+            const secondStock = makeStockRow({
+                id: "stock-second",
+                packagingUnitId: "card",
+                quantity: 1,
+                batchNumber: "batch-second",
+                expiryDate: "2028-01-01",
+            });
+            const db = makeDatabase([firstStock, secondStock]);
+            installExistingProduct(db);
+            installDatabase(db);
+
+            await expect(createSale(saleFor(4))).rejects.toThrow("Insufficient stock");
+
+            expect(db.state.inventory).toEqual([firstStock, secondStock]);
+            expect(db.state.sales).toEqual([]);
+            expect(db.state.saleItems).toEqual([]);
+            expect(db.state.activities).toEqual([]);
+            expect(db.execute.mock.calls.some(([sql]) => /(?:UPDATE|DELETE) FROM inventory_stock/i.test(sql))).toBe(false);
+            expect(db.execute).toHaveBeenCalledWith("ROLLBACK");
+        });
+
+        it("respects a pharmacist-selected non-FEFO stock allocation instead of silently replacing it with FEFO", async () => {
+            const fefoStock = makeStockRow({
+                id: "stock-fefo",
+                packagingUnitId: "card",
+                quantity: 10,
+                batchNumber: "batch-fefo",
+                expiryDate: "2027-01-01",
+            });
+            const alternativeStock = makeStockRow({
+                id: "stock-alternative",
+                packagingUnitId: "card",
+                quantity: 15,
+                batchNumber: "batch-alternative",
+                expiryDate: "2028-01-01",
+            });
+            const db = makeDatabase([alternativeStock, fefoStock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const sale = {
+                ...saleFor(12),
+                id: "sale-selected",
+                items: [{
+                    ...saleFor(12).items[0],
+                    id: "sale-selected-item",
+                    saleId: "sale-selected",
+                }],
+            } as Sale & {
+                selectedAllocation?: {
+                    items: Array<{
+                        productId: string;
+                        variantId: string;
+                        packagingUnitId: string;
+                        quantity: number;
+                        allocations: Array<{ stockRowId: string; quantity: number; batchNumber: string; expiryDate: string; sellingPrice?: number }>;
+                    }>;
+                };
+            };
+            sale.selectedAllocation = {
+                items: [{
+                    productId: "product-1",
+                    variantId: "variant-1",
+                    packagingUnitId: "card",
+                    quantity: 12,
+                    allocations: [{
+                        stockRowId: "stock-alternative",
+                        quantity: 12,
+                        batchNumber: "batch-alternative",
+                        expiryDate: "2028-01-01",
+                        sellingPrice: 7,
+                    }],
+                }],
+            };
+
+            await createSale(sale as any);
+
+            expect(db.state.inventory).toEqual(expect.arrayContaining([
+                expect.objectContaining({ id: "stock-fefo", quantity: 10, batchNumber: "batch-fefo" }),
+                expect.objectContaining({ id: "stock-alternative", quantity: 3, batchNumber: "batch-alternative" }),
+            ]));
+            expect(db.state.saleItemAllocations[0][7]).toBe("batch-alternative");
+        });
+
+        it("consumes exactly the explicitly selected multiple stock rows through Inventory", async () => {
+            const earlierStock = makeStockRow({
+                id: "stock-earlier",
+                packagingUnitId: "card",
+                quantity: 2,
+                batchNumber: "batch-earlier",
+                expiryDate: "2027-01-01",
+            });
+            const laterStock = makeStockRow({
+                id: "stock-later",
+                packagingUnitId: "card",
+                quantity: 2,
+                batchNumber: "batch-later",
+                expiryDate: "2028-01-01",
+            });
+            const db = makeDatabase([earlierStock, laterStock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const inventoryMutation = vi.spyOn(inventoryMutations, "applyInventoryStockAllocation");
+            const sale = {
+                ...saleFor(3),
+                id: "sale-explicit-multiple",
+                items: [{ ...saleFor(3).items[0], id: "sale-item-explicit-multiple", saleId: "sale-explicit-multiple" }],
+            } as Sale & { selectedAllocation?: { items: any[] } };
+            sale.selectedAllocation = {
+                items: [{
+                    saleItemId: "sale-item-explicit-multiple",
+                    productId: "product-1",
+                    variantId: "variant-1",
+                    packagingUnitId: "card",
+                    quantity: 3,
+                    allocations: [
+                        { stockRowId: "stock-later", quantity: 1, sellingPrice: 7 },
+                        { stockRowId: "stock-earlier", quantity: 2, sellingPrice: 7 },
+                    ],
+                }],
+            };
+
+            try {
+                await createSale(sale as Sale);
+
+                expect(inventoryMutation).toHaveBeenCalledWith(
+                    db,
+                    expect.arrayContaining([
+                        expect.objectContaining({ stockRowId: "stock-later", quantityToDeduct: 1 }),
+                        expect.objectContaining({ stockRowId: "stock-earlier", quantityToDeduct: 2 }),
+                    ])
+                );
+                expect(db.state.inventory).toEqual([expect.objectContaining({
+                    id: "stock-later",
+                    quantity: 1,
+                    batchNumber: "batch-later",
+                })]);
+                expect(db.state.saleItems).toEqual([
+                    ["sale-item-explicit-multiple", "sale-explicit-multiple", "product-1", "variant-1", "card", 3, 7, null, null],
+                ]);
+                expect(db.state.saleItemAllocations.map((allocation) => [allocation[2], allocation[3], allocation[7], allocation[8]])).toEqual([
+                    ["stock-later", 1, "batch-later", "2028-01-01"],
+                    ["stock-earlier", 2, "batch-earlier", "2027-01-01"],
+                ]);
+                expect(db.state.activities[0].details).toMatchObject({
+                    items: [{
+                        allocations: [
+                            { quantity: 1, batchNumber: "batch-later", expiryDate: "2028-01-01" },
+                            { quantity: 2, batchNumber: "batch-earlier", expiryDate: "2027-01-01" },
+                        ],
+                    }],
+                });
+                const executedSql = db.execute.mock.calls.map(([sql]) => sql);
+                const inventoryMutationIndex = executedSql.findIndex((sql) =>
+                    sql.includes("UPDATE inventory_stock") || sql.includes("DELETE FROM inventory_stock")
+                );
+                const saleItemIndex = executedSql.findIndex((sql) => sql.includes("INSERT INTO sale_items"));
+                const activityIndex = executedSql.findIndex((sql) => sql.includes("INSERT INTO activities"));
+                const commitIndex = executedSql.indexOf("COMMIT");
+                expect(inventoryMutationIndex).toBeGreaterThan(-1);
+                expect(saleItemIndex).toBeLessThan(activityIndex);
+                expect(activityIndex).toBeLessThan(commitIndex);
+            } finally {
+                inventoryMutation.mockRestore();
+            }
+        });
+
+        it("validates explicit stock selection through the configured packaging conversion", async () => {
+            const stock = makeStockRow({ id: "stock-sachet", packagingUnitId: "sachet", quantity: 2 });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const sale = {
+                ...saleFor(10, "card"),
+                id: "sale-selected-conversion",
+                items: [{ ...saleFor(10, "card").items[0], id: "sale-item-selected-conversion", saleId: "sale-selected-conversion" }],
+            } as Sale & { selectedAllocation?: { items: any[] } };
+            sale.selectedAllocation = {
+                items: [{
+                    saleItemId: "sale-item-selected-conversion",
+                    productId: "product-1",
+                    variantId: "variant-1",
+                    packagingUnitId: "card",
+                    quantity: 10,
+                    allocations: [{ stockRowId: "stock-sachet", quantity: 10 }],
+                }],
+            };
+
+            await createSale(sale as Sale);
+
+            expect(db.state.inventory).toEqual([expect.objectContaining({ id: "stock-sachet", quantity: 1 })]);
+            expect(db.state.saleItems[0]).toEqual([
+                expect.any(String), "sale-selected-conversion", "product-1", "variant-1", "card", 10, 7, "batch-sachet", "2027-01-01",
+            ]);
+            expect(db.state.saleItemAllocations).toHaveLength(1);
+            expect(db.state.saleItemAllocations[0]).toMatchObject([
+                expect.any(String), "sale-item-selected-conversion", "stock-sachet", 10, "sachet", "Sachet", 1, "batch-sachet", "2027-01-01", 70,
+            ]);
+        });
+
+        it("rejects an explicit stock quantity that violates packaging conversion", async () => {
+            const stock = makeStockRow({ id: "stock-sachet", packagingUnitId: "sachet", quantity: 2 });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const sale = {
+                ...saleFor(9, "card"),
+                id: "sale-invalid-conversion",
+                items: [{ ...saleFor(9, "card").items[0], id: "sale-item-invalid-conversion", saleId: "sale-invalid-conversion" }],
+            } as Sale & { selectedAllocation?: { items: any[] } };
+            sale.selectedAllocation = {
+                items: [{
+                    saleItemId: "sale-item-invalid-conversion",
+                    productId: "product-1",
+                    variantId: "variant-1",
+                    packagingUnitId: "card",
+                    quantity: 9,
+                    allocations: [{ stockRowId: "stock-sachet", quantity: 9 }],
+                }],
+            };
+
+            await expect(createSale(sale as Sale)).rejects.toThrow("Selected stock allocation is invalid");
+            expect(db.state.inventory).toEqual([stock]);
+            expect(db.state.sales).toEqual([]);
+            expect(db.state.saleItems).toEqual([]);
+            expect(db.state.saleItemAllocations).toEqual([]);
+            expect(db.state.activities).toEqual([]);
+        });
+
+        it("rejects an explicit allocation that exceeds its selected row instead of using another row", async () => {
+            const fefoStock = makeStockRow({ id: "stock-fefo", packagingUnitId: "card", quantity: 10, batchNumber: "batch-fefo" });
+            const selectedStock = makeStockRow({ id: "stock-selected", packagingUnitId: "card", quantity: 2, batchNumber: "batch-selected" });
+            const db = makeDatabase([fefoStock, selectedStock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const sale = {
+                ...saleFor(3),
+                id: "sale-selected-insufficient",
+                items: [{ ...saleFor(3).items[0], id: "sale-item-selected-insufficient", saleId: "sale-selected-insufficient" }],
+            } as Sale & { selectedAllocation?: { items: any[] } };
+            sale.selectedAllocation = {
+                items: [{
+                    saleItemId: "sale-item-selected-insufficient",
+                    productId: "product-1",
+                    variantId: "variant-1",
+                    packagingUnitId: "card",
+                    quantity: 3,
+                    allocations: [{ stockRowId: "stock-selected", quantity: 3 }],
+                }],
+            };
+
+            await expect(createSale(sale as Sale)).rejects.toThrow("Selected stock allocation is invalid");
+            expect(db.state.inventory).toEqual([fefoStock, selectedStock]);
+            expect(db.state.sales).toEqual([]);
+            expect(db.state.activities).toEqual([]);
+            expect(db.execute.mock.calls.some(([sql]) => /(?:UPDATE|DELETE) FROM inventory_stock/i.test(sql))).toBe(false);
+        });
+
+        it("keeps direct inventory SQL out of the Sales page", () => {
+            expect(salesPageSource).not.toMatch(/\b(?:UPDATE|DELETE)\s+inventory_stock\b/i);
+            expect(salesPageSource).not.toContain("applyInventoryStockAllocation");
+        });
+
+        it("rejects an invalid pharmacist-selected allocation instead of silently falling back to FEFO", async () => {
+            const stock = makeStockRow({ id: "stock-fefo", packagingUnitId: "card", quantity: 10, batchNumber: "batch-fefo", expiryDate: "2027-01-01" });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const sale = {
+                ...saleFor(5),
+                id: "sale-invalid-selection",
+                items: [{
+                    ...saleFor(5).items[0],
+                    id: "sale-invalid-selection-item",
+                    saleId: "sale-invalid-selection",
+                }],
+            } as Sale & {
+                selectedAllocation?: {
+                    items: Array<{
+                        productId: string;
+                        variantId: string;
+                        packagingUnitId: string;
+                        quantity: number;
+                        allocations: Array<{ stockRowId: string; quantity: number; batchNumber: string; expiryDate: string }>;
+                    }>;
+                };
+            };
+            sale.selectedAllocation = {
+                items: [{
+                    productId: "product-1",
+                    variantId: "variant-1",
+                    packagingUnitId: "card",
+                    quantity: 5,
+                    allocations: [{
+                        stockRowId: "missing-stock-row",
+                        quantity: 5,
+                        batchNumber: "batch-does-not-exist",
+                        expiryDate: "2030-01-01",
+                    }],
+                }],
+            };
+
+            await expect(createSale(sale as any)).rejects.toThrow("Selected stock allocation is invalid");
+            expect(db.state.inventory).toEqual([expect.objectContaining({ id: "stock-fefo", quantity: 10 })]);
+            expect(db.state.sales).toEqual([]);
+            expect(db.state.activities).toEqual([]);
+        });
+
+        it("rejects an incomplete explicit allocation payload instead of falling back to FEFO", async () => {
+            const stock = makeStockRow({ id: "stock-fefo", packagingUnitId: "card", quantity: 10, batchNumber: "batch-fefo", expiryDate: "2027-01-01" });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+            const sale = saleFor(5) as Sale & { selectedAllocation?: { items: unknown[] } };
+            sale.selectedAllocation = { items: [] };
+
+            await expect(createSale(sale as Sale)).rejects.toThrow("Selected stock allocation is invalid");
+            expect(db.state.inventory).toEqual([expect.objectContaining({ id: "stock-fefo", quantity: 10 })]);
+            expect(db.state.sales).toEqual([]);
+            expect(db.state.activities).toEqual([]);
+        });
+
+        it("fulfills an unpinned sale from the single FEFO position", async () => {
+            const stock = makeStockRow({ id: "stock-fefo", packagingUnitId: "card", quantity: 10, batchNumber: "batch-fefo" });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+
+            await createSale(saleFor(1));
+
+            expect(db.state.inventory).toEqual([expect.objectContaining({ id: "stock-fefo", quantity: 9 })]);
+            expect(db.state.saleItems).toEqual([
+                [expect.any(String), "sale-1", "product-1", "variant-1", "card", 1, 7, "batch-fefo", "2027-01-01"],
+            ]);
+            expect(db.state.activities).toHaveLength(1);
         });
 
         it("completes a sale by consuming a whole source Sachet and records requested units", async () => {
@@ -1790,7 +2644,7 @@ describe("Stage 1 behavior characterization", () => {
             const sale = saleFor(10);
             sale.notes = "Customer requested a receipt";
 
-            await createSale(sale);
+            await createSale(withSelectedAllocations(sale, [[{ stockRowId: "stock-sachet-1", quantity: 10 }]]) as Sale);
 
             expect(db.state.inventory).toEqual([]);
             expect(db.state.saleItems).toHaveLength(1);
@@ -1848,7 +2702,10 @@ describe("Stage 1 behavior characterization", () => {
             sale.discount = 2;
             sale.notes = "Manual discount approved";
 
-            await createSale(sale);
+            await createSale(withSelectedAllocations(sale, [
+                [{ stockRowId: "stock-sachet-1", quantity: 1 }],
+                [{ stockRowId: "stock-sachet-1", quantity: 1 }],
+            ]) as Sale);
 
             expect(db.state.saleItems).toHaveLength(2);
             expect(db.state.activities).toHaveLength(1);
@@ -1868,6 +2725,105 @@ describe("Stage 1 behavior characterization", () => {
             });
         });
 
+        it("rejects a completed sale before mutating inventory, sale items, or activity", async () => {
+            const stock = makeStockRow({ packagingUnitId: "card", quantity: 10 });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            db.state.sales.push("sale-1");
+            db.state.saleStatuses["sale-1"] = "completed";
+            db.state.saleItems.push(["existing-item", "sale-1", "product-1", "variant-1", "card", 2, 7, "batch-sachet", "2027-01-01"]);
+            db.state.activities.push({
+                id: "activity-1",
+                eventType: "sale.completed",
+                occurredAt: "2026-09-28T00:00:00.000Z",
+                entityType: "sale",
+                entityId: "sale-1",
+                entityLabel: "Sale 2026-09-28",
+                summary: "Completed sale: 1 item, total ₦14.00, sold by Tester",
+                reason: null,
+                changes: null,
+                details: {
+                    saleDate: "2026-09-28",
+                    soldBy: "Tester",
+                    notes: null,
+                    totalAmount: 14,
+                    discount: 0,
+                    items: [{
+                        productId: "product-1",
+                        productName: "Test medicine",
+                        variantId: "variant-1",
+                        variantLabel: "10 mg Tablet",
+                        packagingUnitId: "card",
+                        packagingUnitName: "Card",
+                        quantity: 2,
+                        unitPrice: 7,
+                        lineAmount: 14,
+                        allocations: [{ quantity: 2, batchNumber: "batch-sachet", expiryDate: "2027-01-01" }],
+                    }],
+                },
+            });
+            installDatabase(db);
+
+            await expect(createSale(withSelectedAllocations(saleFor(5), [[{ stockRowId: "stock-sachet-1", quantity: 5 }]]) as Sale))
+                .rejects.toThrow("Completed sales cannot be completed again");
+
+            expect(db.state.sales.filter((id) => id === "sale-1")).toHaveLength(1);
+            expect(db.state.saleStatuses["sale-1"]).toBe("completed");
+            expect(db.state.saleItems).toEqual([
+                ["existing-item", "sale-1", "product-1", "variant-1", "card", 2, 7, "batch-sachet", "2027-01-01"],
+            ]);
+            expect(db.state.inventory).toEqual([expect.objectContaining({
+                id: "stock-sachet-1",
+                quantity: 10,
+            })]);
+            expect(db.state.activities).toHaveLength(1);
+            expect(db.state.activities[0].eventType).toBe("sale.completed");
+            expect(db.state.activities[0].summary).toBe("Completed sale: 1 item, total ₦14.00, sold by Tester");
+        });
+
+        it("completes a draft sale with the existing successful contract", async () => {
+            const stock = makeStockRow({ packagingUnitId: "card", quantity: 10 });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+
+            const draft = { ...saleFor(1), status: "draft" as const };
+            await saveSaleDraft(draft);
+
+            await createSale(withSelectedAllocations({ ...draft, status: "completed", totalAmount: 7 }, [[{ stockRowId: "stock-sachet-1", quantity: 1 }]]) as Sale);
+
+            expect(db.state.saleStatuses["sale-1"]).toBe("completed");
+            expect(db.state.saleItems).toHaveLength(1);
+            expect(db.state.inventory).toEqual([expect.objectContaining({
+                id: "stock-sachet-1",
+                quantity: 9,
+            })]);
+            expect(db.state.activities).toHaveLength(1);
+            expect(db.state.activities[0]).toMatchObject({
+                eventType: "sale.completed",
+                entityId: "sale-1",
+            });
+        });
+
+        it("completes a new sale normally", async () => {
+            const stock = makeStockRow({ packagingUnitId: "card", quantity: 10 });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            installDatabase(db);
+
+            await createSale(withSelectedAllocations(saleFor(5), [[{ stockRowId: "stock-sachet-1", quantity: 5 }]]) as Sale);
+
+            expect(db.state.sales).toContain("sale-1");
+            expect(db.state.saleStatuses["sale-1"]).toBe("completed");
+            expect(db.state.inventory).toEqual([expect.objectContaining({
+                id: "stock-sachet-1",
+                quantity: 5,
+            })]);
+            expect(db.state.saleItems).toHaveLength(1);
+            expect(db.state.activities).toHaveLength(1);
+            expect(db.state.activities[0].eventType).toBe("sale.completed");
+        });
+
         it("rolls back the Sale and Inventory if Activity insertion fails", async () => {
             const stock = makeStockRow({ packagingUnitId: "card", quantity: 10 });
             const db = makeDatabase([stock]);
@@ -1876,10 +2832,12 @@ describe("Stage 1 behavior characterization", () => {
             db.failures.activityInsert = true;
             installDatabase(db);
 
-            await expect(createSale(saleFor(5))).rejects.toThrow("Activity insert failed");
+            await expect(createSale(withSelectedAllocations(saleFor(5), [[{ stockRowId: "stock-sachet-1", quantity: 5 }]]) as Sale))
+                .rejects.toThrow("Activity insert failed");
 
             expect(db.state.sales).toEqual([]);
             expect(db.state.saleItems).toEqual([]);
+            expect(db.state.saleItemAllocations).toEqual([]);
             expect(db.state.inventory).toEqual([stock]);
             expect(db.state.activities).toEqual([]);
             expect(db.execute).toHaveBeenCalledWith("ROLLBACK");
@@ -1893,15 +2851,35 @@ describe("Stage 1 behavior characterization", () => {
             db.failures.inventoryUpdate = true;
             installDatabase(db);
 
-            await expect(createSale(saleFor(5))).rejects.toThrow("Inventory update failed");
+            await expect(createSale(withSelectedAllocations(saleFor(5), [[{ stockRowId: "stock-sachet-1", quantity: 5 }]]) as Sale))
+                .rejects.toThrow("Inventory update failed");
 
             expect(db.state.sales).toEqual([]);
             expect(db.state.saleItems).toEqual([]);
+            expect(db.state.saleItemAllocations).toEqual([]);
             expect(db.state.inventory).toEqual([stock]);
             expect(db.state.activities).toEqual([]);
+            expect(db.execute).toHaveBeenCalledWith("ROLLBACK");
         });
 
-        it("applies a multi-row sale allocation in FEFO order", async () => {
+        it("rolls back the Sale, allocation rows, and Inventory if allocation persistence fails", async () => {
+            const stock = makeStockRow({ id: "stock-allocation-failure", packagingUnitId: "card", quantity: 5 });
+            const db = makeDatabase([stock]);
+            installExistingProduct(db);
+            db.failures.saleItemAllocationInsert = true;
+            installDatabase(db);
+
+            await expect(createSale(saleFor(2))).rejects.toThrow("Sale item allocation insert failed");
+
+            expect(db.state.sales).toEqual([]);
+            expect(db.state.saleItems).toEqual([]);
+            expect(db.state.saleItemAllocations).toEqual([]);
+            expect(db.state.inventory).toEqual([stock]);
+            expect(db.state.activities).toEqual([]);
+            expect(db.execute).toHaveBeenCalledWith("ROLLBACK");
+        });
+
+        it("applies only the explicitly selected multi-row sale allocation", async () => {
             const earlierStock = makeStockRow({
                 id: "stock-earlier",
                 packagingUnitId: "card",
@@ -1921,7 +2899,10 @@ describe("Stage 1 behavior characterization", () => {
             db.state.variants.push("variant-1");
             installDatabase(db);
 
-            await createSale(saleFor(3));
+            await createSale(withSelectedAllocations(saleFor(3), [[
+                { stockRowId: "stock-earlier", quantity: 2 },
+                { stockRowId: "stock-later", quantity: 1 },
+            ]]) as Sale);
 
             expect(db.state.inventory).toEqual([expect.objectContaining({
                 id: "stock-later",
@@ -1930,8 +2911,11 @@ describe("Stage 1 behavior characterization", () => {
                 expiryDate: "2028-01-01",
             })]);
             expect(db.state.saleItems).toEqual([
-                [expect.any(String), "sale-1", "product-1", "variant-1", "card", 2, 7, "batch-earlier", "2027-01-01"],
-                [expect.any(String), "sale-1", "product-1", "variant-1", "card", 1, 7, "batch-later", "2028-01-01"],
+                ["sale-item-1", "sale-1", "product-1", "variant-1", "card", 3, 7, null, null],
+            ]);
+            expect(db.state.saleItemAllocations.map((allocation) => [allocation[1], allocation[2], allocation[3], allocation[7], allocation[8]])).toEqual([
+                ["sale-item-1", "stock-earlier", 2, "batch-earlier", "2027-01-01"],
+                ["sale-item-1", "stock-later", 1, "batch-later", "2028-01-01"],
             ]);
             expect(db.state.activities).toHaveLength(1);
             expect(db.state.activities[0].details).toMatchObject({
@@ -1953,23 +2937,29 @@ describe("Stage 1 behavior characterization", () => {
             installDatabase(db);
             const sale = saleFor(2);
             sale.items.push({ ...sale.items[0], id: "sale-item-2" });
+            const selectedSale = withSelectedAllocations(sale, [
+                [{ stockRowId: "stock-sachet-1", quantity: 2 }],
+                [{ stockRowId: "stock-sachet-1", quantity: 2 }],
+            ]);
 
-            await expect(createSale(sale)).rejects.toThrow("Insufficient stock");
+            await expect(createSale(selectedSale as Sale)).rejects.toThrow("Selected stock allocation is invalid");
 
             expect(db.state.inventory).toEqual([stock]);
             expect(db.state.sales).toEqual([]);
             expect(db.state.saleItems).toEqual([]);
             expect(db.state.activities).toEqual([]);
+            expect(db.execute.mock.calls.some(([sql]) => /(?:UPDATE|DELETE) FROM inventory_stock/i.test(sql))).toBe(false);
         });
 
-        it("rolls back a sale that would require splitting a larger package", async () => {
+        it("rejects an explicitly selected allocation that would split a larger package", async () => {
             const stock = makeStockRow();
             const db = makeDatabase([stock]);
             db.state.products.push("product-1");
             db.state.variants.push("variant-1");
             installDatabase(db);
 
-            await expect(createSale(saleFor(3))).rejects.toThrow("without splitting stock incorrectly");
+            await expect(createSale(withSelectedAllocations(saleFor(3), [[{ stockRowId: "stock-sachet-1", quantity: 3 }]]) as Sale))
+                .rejects.toThrow("Selected stock allocation is invalid");
 
             expect(db.state.inventory).toEqual([stock]);
             expect(db.state.sales).toEqual([]);

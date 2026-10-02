@@ -34,7 +34,11 @@ import {
 import {
     addInventoryStock,
     applyInventoryStockAllocation,
+    getEligibleInventoryStockOptionsForSale as getInventoryEligibleStockOptionsForSale,
+    planInventoryStockFulfillment,
     setInventoryStockEntry,
+    type InventorySaleStockOption,
+    type SelectedInventoryStockAllocation,
 } from "./inventory";
 import {
     getInventoryStockRowsForVariant,
@@ -56,14 +60,13 @@ import {
 import {
     getSaleRows,
     getSaleRowById,
-    selectSaleIdsById,
     selectSaleIdsByIdAndStatus,
     insertSaleRow,
     updateSaleRow,
     deleteSaleItemsBySaleId,
     deleteSaleDraftById,
     insertSaleItemRow,
-    insertSaleItemRowWithAllocation,
+    insertSaleItemAllocationRow,
 } from "./salesRepository";
 import {
     product1, product2, product3, product4, product5, product6, product7,
@@ -273,13 +276,76 @@ export const initializeDatabase = async () => {
             variant_id TEXT NOT NULL,
             packaging_unit_id TEXT NOT NULL,
             quantity INTEGER NOT NULL,
-            unit_price REAL NOT NULL,
+            unit_price REAL,
             batch_number TEXT,
             expiry_date TEXT,
             FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
             FOREIGN KEY (product_id) REFERENCES products(id),
             FOREIGN KEY (variant_id) REFERENCES variants(id),
             FOREIGN KEY (packaging_unit_id) REFERENCES packaging_units(id)
+        )
+    `);
+
+    const saleItemColumns = await db.select<Array<{ name: string; notnull: number }>>(
+        `PRAGMA table_info(sale_items)`
+    );
+    const unitPriceColumn = saleItemColumns.find((column) => column.name === "unit_price");
+    if (unitPriceColumn?.notnull === 1) {
+        try {
+            await db.execute(`BEGIN`);
+            await db.execute(`
+                CREATE TABLE sale_items_rebuilt (
+                    id TEXT PRIMARY KEY,
+                    sale_id TEXT NOT NULL,
+                    product_id TEXT NOT NULL,
+                    variant_id TEXT NOT NULL,
+                    packaging_unit_id TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    unit_price REAL,
+                    batch_number TEXT,
+                    expiry_date TEXT,
+                    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
+                    FOREIGN KEY (product_id) REFERENCES products(id),
+                    FOREIGN KEY (variant_id) REFERENCES variants(id),
+                    FOREIGN KEY (packaging_unit_id) REFERENCES packaging_units(id)
+                )
+            `);
+            await db.execute(`
+                INSERT INTO sale_items_rebuilt(
+                    id, sale_id, product_id, variant_id, packaging_unit_id,
+                    quantity, unit_price, batch_number, expiry_date
+                )
+                SELECT
+                    id, sale_id, product_id, variant_id, packaging_unit_id,
+                    quantity, unit_price, batch_number, expiry_date
+                FROM sale_items
+            `);
+            await db.execute(`DROP TABLE sale_items`);
+            await db.execute(`ALTER TABLE sale_items_rebuilt RENAME TO sale_items`);
+            await db.execute(`COMMIT`);
+        } catch (error) {
+            try {
+                await db.execute(`ROLLBACK`);
+            } catch {
+                // Preserve the migration error.
+            }
+            throw error;
+        }
+    }
+
+    await db.execute(`
+        CREATE TABLE IF NOT EXISTS sale_item_allocations (
+            id TEXT PRIMARY KEY,
+            sale_item_id TEXT NOT NULL,
+            source_inventory_stock_id TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            source_packaging_unit_id TEXT NOT NULL,
+            source_packaging_unit_name TEXT NOT NULL,
+            source_quantity INTEGER NOT NULL,
+            batch_number TEXT,
+            expiry_date TEXT,
+            selling_price REAL NOT NULL,
+            FOREIGN KEY (sale_item_id) REFERENCES sale_items(id) ON DELETE CASCADE
         )
     `);
 
@@ -1143,104 +1209,21 @@ type StockRowForSale = {
     sellingPrice: number;
 };
 
-export type SaleStockAllocation = {
-    batchNumber: string | null;
-    expiryDate: string | null;
-    quantity: number;
-};
+export type SaleStockAllocation = InventorySaleStockOption;
 
-const getSaleStockAllocation = (
-    item: Pick<SaleItem, "productId" | "variantId" | "packagingUnitId" | "quantity">,
-    stockRows: StockRowForSale[],
-    packagingUnits: PackagingUnit[]
-) => {
-    if (!Number.isFinite(item.quantity) || item.quantity <= 0 || !Number.isInteger(item.quantity)) {
-        throw new Error("Sale quantity must be a positive whole number");
-    }
-
-    if (packagingUnits.length === 0) {
-        throw new Error("This product has no packaging units configured for sale");
-    }
-
-    const requestedUnit = packagingUnits.find((unit) => unit.id === item.packagingUnitId);
-    if (!requestedUnit) {
-        throw new Error(`Packaging unit ${item.packagingUnitId} does not belong to variant ${item.variantId}`);
-    }
-
-    const candidates = stockRows
-        .filter((row) => row.quantity > 0)
-        .map((row) => ({
-            row,
-            conversionFactor: getConversionFactor(row.packagingUnitId, requestedUnit.id, packagingUnits),
-        }))
-        .sort((left, right) => {
-            const leftExpiry = left.row.expiryDate?.trim() || "9999-12-31";
-            const rightExpiry = right.row.expiryDate?.trim() || "9999-12-31";
-            const expiryComparison = leftExpiry.localeCompare(rightExpiry);
-            if (expiryComparison !== 0) return expiryComparison;
-
-            const leftExact = left.row.packagingUnitId === requestedUnit.id ? 0 : 1;
-            const rightExact = right.row.packagingUnitId === requestedUnit.id ? 0 : 1;
-            if (leftExact !== rightExact) return leftExact - rightExact;
-
-            return left.row.id.localeCompare(right.row.id);
-        });
-
-    const availableQuantity = candidates.reduce(
-        (total, candidate) => total + candidate.row.quantity * candidate.conversionFactor,
-        0
-    );
-    if (availableQuantity < item.quantity) {
-        throw new Error(
-            `Insufficient stock: requested ${item.quantity} ${requestedUnit.name || "unit"}, only ${availableQuantity} available`
-        );
-    }
-
-    let remainingQuantity = item.quantity;
-    const allocations: Array<{ row: StockRowForSale; conversionFactor: number; quantity: number; sourceQuantity: number }> = [];
-
-    for (const candidate of candidates) {
-        if (remainingQuantity <= 0) break;
-
-        const availableInRequestedUnit = candidate.row.quantity * candidate.conversionFactor;
-        const quantityToAllocate = Math.min(remainingQuantity, availableInRequestedUnit);
-        const sourceQuantityToUse = Math.floor(quantityToAllocate / candidate.conversionFactor);
-        if (sourceQuantityToUse <= 0) {
-            continue;
-        }
-
-        const actualRequestedQuantity = sourceQuantityToUse * candidate.conversionFactor;
-        if (actualRequestedQuantity <= 0) {
-            continue;
-        }
-
-        allocations.push({
-            row: candidate.row,
-            conversionFactor: candidate.conversionFactor,
-            quantity: actualRequestedQuantity,
-            sourceQuantity: sourceQuantityToUse,
-        });
-        remainingQuantity -= actualRequestedQuantity;
-    }
-
-    if (remainingQuantity > 0) {
-        throw new Error(
-            `Unable to allocate ${item.quantity} ${requestedUnit.name || "unit"} safely from the available inventory without splitting stock incorrectly.`
-        );
-    }
-
-    return { requestedUnit, allocations };
-};
-
-const applySaleStockAllocation = (
+export const getEligibleInventoryStockOptionsForSale = (
     db: SqliteDatabase,
-    allocations: Array<{ row: StockRowForSale; sourceQuantity: number }>
-) => applyInventoryStockAllocation(db, allocations.map(({ row, sourceQuantity }) => ({
-    stockRowId: row.id,
-    availableQuantity: row.quantity,
-    quantityToDeduct: sourceQuantity,
-    batchNumber: row.batchNumber,
-})));
+    productId: string,
+    variantId: string,
+    packagingUnitId: string,
+    quantity: number
+): Promise<SaleStockAllocation[]> => getInventoryEligibleStockOptionsForSale(
+    db,
+    productId,
+    variantId,
+    packagingUnitId,
+    quantity
+);
 
 export const getSaleStockAllocationPreview = async (
     productId: string,
@@ -1249,26 +1232,7 @@ export const getSaleStockAllocationPreview = async (
     quantity: number
 ): Promise<SaleStockAllocation[]> => {
     const db = await loadDatabase();
-    const [packagingUnits, stockRows] = await Promise.all([
-        getPackagingUnitsForVariant(db, variantId),
-        selectInventoryStockRowsByVariant(db, productId, variantId),
-    ]);
-
-    if (packagingUnits.length === 0) {
-        return [];
-    }
-
-    const { allocations } = getSaleStockAllocation(
-        { productId, variantId, packagingUnitId, quantity },
-        stockRows,
-        packagingUnits
-    );
-    return allocations.map(({ row, quantity: allocatedQuantity }) => ({
-        batchNumber: row.batchNumber,
-        expiryDate: row.expiryDate,
-        quantity: allocatedQuantity,
-
-    }));
+    return getEligibleInventoryStockOptionsForSale(db, productId, variantId, packagingUnitId, quantity);
 };
 
 export const deleteSaleDraft = async (saleId: string) => {
@@ -1285,26 +1249,6 @@ export const deleteSaleDraft = async (saleId: string) => {
         await db.execute(`ROLLBACK`);
         throw error;
     }
-};
-
-export const deductStockForSaleItem = async (
-    db: SqliteDatabase,
-    item: SaleItem
-) : Promise<SaleStockAllocation[]> => {
-    const packagingUnits = await getPackagingUnitsForVariant(db, item.variantId);
-    if (packagingUnits.length === 0) {
-        throw new Error("This product has no packaging units configured for sale");
-    }
-
-    const stockRows = await selectInventoryStockRowsByVariant(db, item.productId, item.variantId);
-    const { allocations } = getSaleStockAllocation(item, stockRows, packagingUnits);
-    await applySaleStockAllocation(db, allocations);
-
-    return allocations.map(({ row, quantity }) => ({
-        batchNumber: row.batchNumber,
-        expiryDate: row.expiryDate,
-        quantity,
-    }));
 };
 
 export const saveSaleDraft = async (sale: Sale) => {
@@ -1350,6 +1294,10 @@ export const saveSaleDraft = async (sale: Sale) => {
 
 export const createSale = async (sale: Sale) => {
     const db = await loadDatabase();
+    const saleSelection = sale as Sale & {
+        selectedAllocation?: SelectedInventoryStockAllocation;
+    };
+    const hasExplicitSelection = Object.prototype.hasOwnProperty.call(saleSelection, "selectedAllocation");
 
     try {
         await db.execute(`PRAGMA foreign_keys = ON;`);
@@ -1357,6 +1305,10 @@ export const createSale = async (sale: Sale) => {
 
         if (!sale.items || sale.items.length === 0) {
             throw new Error("Sale must contain at least one item");
+        }
+        if (hasExplicitSelection &&
+            (!saleSelection.selectedAllocation || !Array.isArray(saleSelection.selectedAllocation.items))) {
+            throw new Error("Selected stock allocation is invalid");
         }
 
         for (const item of sale.items) {
@@ -1383,12 +1335,23 @@ export const createSale = async (sale: Sale) => {
                 throw new Error(`Packaging unit ${item.packagingUnitId} does not belong to variant ${item.variantId}`);
             }
 
-            const packagingUnits = await getPackagingUnitsForVariant(db, item.variantId);
-            const stockRows = await selectInventoryStockRowsByVariant(db, item.productId, item.variantId);
-            getSaleStockAllocation(item, stockRows, packagingUnits);
         }
 
-        const existingSale = await selectSaleIdsById(db, sale.id);
+        const existingSale = await selectSaleIdsByIdAndStatus(db, sale.id);
+        if (existingSale.length > 0 && existingSale[0].status === "completed") {
+            throw new Error("Completed sales cannot be completed again");
+        }
+
+        const fulfillmentPlan = await planInventoryStockFulfillment(
+            db,
+            sale.items,
+            hasExplicitSelection
+                ? {
+                    type: "selected",
+                    selectedAllocation: saleSelection.selectedAllocation as SelectedInventoryStockAllocation,
+                }
+                : { type: "fefo" }
+        );
         if (existingSale.length > 0) {
             await updateSaleRow(db, sale, "completed");
         } else {
@@ -1402,21 +1365,47 @@ export const createSale = async (sale: Sale) => {
             allocations: Array<{ quantity: number; batchNumber: string | null; expiryDate: string | null }>;
         }> = [];
 
-        for (const item of sale.items) {
-            const packagingUnits = await getPackagingUnitsForVariant(db, item.variantId);
-            const stockRows = await selectInventoryStockRowsByVariant(db, item.productId, item.variantId);
-            const { allocations } = getSaleStockAllocation(item, stockRows, packagingUnits);
+        for (let itemIndex = 0; itemIndex < sale.items.length; itemIndex++) {
+            const { allocations } = fulfillmentPlan[itemIndex];
+            const item = sale.items[itemIndex];
             const activityAllocations: Array<{ quantity: number; batchNumber: string | null; expiryDate: string | null }> = [];
+            const singleAllocation = allocations.length === 1 ? allocations[0] : undefined;
 
-            await applySaleStockAllocation(db, allocations);
-            for (const { row, quantity } of allocations) {
-                await insertSaleItemRowWithAllocation(db, sale.id, item, quantity, row.batchNumber ?? null, row.expiryDate ?? null);
+            await insertSaleItemRow(
+                db,
+                sale.id,
+                item,
+                item.quantity,
+                singleAllocation?.row.batchNumber ?? null,
+                singleAllocation?.row.expiryDate ?? null
+            );
+
+            for (const allocation of allocations) {
+                const { row, quantity, sourceQuantity, sourcePackagingUnitName } = allocation;
+                await insertSaleItemAllocationRow(db, {
+                    saleItemId: item.id,
+                    sourceInventoryStockId: row.id,
+                    quantity,
+                    sourcePackagingUnitId: row.packagingUnitId,
+                    sourcePackagingUnitName,
+                    sourceQuantity,
+                    batchNumber: row.batchNumber ?? undefined,
+                    expiryDate: row.expiryDate ?? undefined,
+                    sellingPrice: row.sellingPrice,
+                });
                 activityAllocations.push({
                     quantity,
                     batchNumber: row.batchNumber ?? null,
                     expiryDate: row.expiryDate ?? null,
                 });
             }
+
+            await applyInventoryStockAllocation(db, allocations.map(({ row, sourceQuantity }) => ({
+                stockRowId: row.id,
+                availableQuantity: row.quantity,
+                quantityToDeduct: sourceQuantity,
+                batchNumber: row.batchNumber,
+            })));
             allocatedSaleItems.push({ item, allocations: activityAllocations });
         }
 
